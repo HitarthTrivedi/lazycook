@@ -1,3 +1,4 @@
+#can input docs
 import asyncio
 import time
 import os
@@ -179,6 +180,21 @@ class Task:
             'metadata': self.metadata
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict):
+        return cls(
+            id=data['id'],
+            conversation_id=data['conversation_id'],
+            task_type=data['task_type'],
+            description=data['description'],
+            priority=data['priority'],
+            status=data['status'],
+            created_at=datetime.fromisoformat(data['created_at']),
+            scheduled_for=datetime.fromisoformat(data['scheduled_for']),
+            result=data.get('result'),
+            metadata=data.get('metadata')
+        )
+@dataclass
 class Document:
         id: str
         filename: str
@@ -475,14 +491,14 @@ class AIAgent:
         Current User Query: {user_query}
         Instructions:
         Instructions:
-        1. Use the conversation history to inform your response but do not mention it explicitly
-        2. Provide a detailed, well-structured response that naturally incorporates relevant context
-        3. Do not reference previous conversations or mention using conversation history
-        4. Make the response feel complete and self-contained
-        5. Include practical examples where relevant
-        6. Consider multiple approaches if applicable
-        7. Be thorough but clear
-        8. Rate your confidence in this solution (0-1)
+        
+        1. Provide a detailed, well-structured response that naturally incorporates relevant context
+        2. Do not reference previous conversations or mention using conversation history
+        3. Make the response feel complete and self-contained
+        4. Include practical examples where relevant
+        5. Consider multiple approaches if applicable
+        6. Be thorough but clear
+        7. Rate your confidence in this solution (0-1)
         """
         try:
             response = await self.model.generate_content_async(prompt)
