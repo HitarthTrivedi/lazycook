@@ -1,0 +1,2157 @@
+import asyncio
+import hashlib
+import json
+import logging
+import mimetypes
+import os
+import threading
+import time
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
+from enum import Enum
+from functools import wraps
+from pathlib import Path
+from threading import Lock
+from typing import Dict, Any, List, Optional, Callable
+
+import google.generativeai as genai
+from rich.align import Align
+from rich.box import ROUNDED
+from rich.columns import Columns
+from rich.console import Console
+from rich.filesize import decimal
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import (
+    Progress,
+    TextColumn,
+    BarColumn,
+    TimeRemainingColumn,
+    TimeElapsedColumn,
+    MofNCompleteColumn
+)
+from rich.progress_bar import ProgressBar
+from rich.prompt import Prompt, Confirm
+from rich.rule import Rule
+from rich.status import Status
+from rich.style import Style
+from rich.syntax import Syntax
+from rich.table import Table
+from rich.text import Text
+
+# --- Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.FileHandler('multi_agent_assistant.log'), logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+
+# --- Decorators ---
+def log_errors(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            import traceback
+            logger.error(f"Error in {func.__name__}: {e}")
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            raise  # Re-raise the exception instead of swallowing it
+
+    return wrapper
+
+
+# --- Data Classes ---
+class AgentRole(Enum):
+    GENERATOR = "generator"
+    ANALYZER = "analyzer"
+    OPTIMIZER = "optimizer"
+    VALIDATOR = "validator"
+
+
+@dataclass
+class AgentResponse:
+    agent_role: AgentRole
+    content: str
+    confidence: float
+    suggestions: List[str]
+    errors_found: List[str]
+    improvements: List[str]
+    metadata: Dict[str, Any]
+
+    def to_dict(self):
+        return {
+            'agent_role': self.agent_role.value,
+            'content': self.content,
+            'confidence': self.confidence,
+            'suggestions': self.suggestions,
+            'errors_found': self.errors_found,
+            'improvements': self.improvements,
+            'metadata': self.metadata
+        }
+
+
+@dataclass
+class MultiAgentSession:
+    session_id: str
+    user_query: str
+    iterations: List[Dict[str, Any]]
+    final_response: str
+    quality_score: float
+    total_iterations: int
+    timestamp: datetime
+    context_used: str
+
+    def to_dict(self):
+        serializable_iterations = []
+        for iteration in self.iterations:
+            serializable_iteration = iteration.copy()
+            for key in ['generator_response', 'analyzer_response', 'optimizer_response', 'validator_response']:
+                if key in serializable_iteration and hasattr(serializable_iteration[key], 'to_dict'):
+                    serializable_iteration[key] = serializable_iteration[key].to_dict()
+                elif key in serializable_iteration and isinstance(serializable_iteration[key], dict):
+                    if 'agent_role' in serializable_iteration[key] and hasattr(
+                            serializable_iteration[key]['agent_role'], 'value'):
+                        serializable_iteration[key]['agent_role'] = serializable_iteration[key]['agent_role'].value
+            serializable_iterations.append(serializable_iteration)
+        return {
+            'session_id': self.session_id,
+            'user_query': self.user_query,
+            'iterations': serializable_iterations,
+            'final_response': self.final_response,
+            'quality_score': self.quality_score,
+            'total_iterations': self.total_iterations,
+            'timestamp': self.timestamp.isoformat(),
+            'context_used': self.context_used
+        }
+
+
+@dataclass
+class Conversation:
+    id: str
+    user_id: str
+    timestamp: datetime
+    user_message: str
+    ai_response: str
+    multi_agent_session: Optional['MultiAgentSession']
+    context: str
+    sentiment: str
+    topics: List[str]
+    potential_followups: List[str]
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'timestamp': self.timestamp.isoformat(),
+            'user_message': self.user_message,
+            'ai_response': self.ai_response,
+            'multi_agent_session': self.multi_agent_session.to_dict() if self.multi_agent_session else None,
+            'context': self.context,
+            'sentiment': self.sentiment,
+            'topics': self.topics,
+            'potential_followups': self.potential_followups
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict):
+        multi_agent_data = data.get('multi_agent_session')
+        multi_agent_session = None
+        if multi_agent_data:
+            multi_agent_session = MultiAgentSession(
+                session_id=multi_agent_data['session_id'],
+                user_query=multi_agent_data['user_query'],
+                iterations=multi_agent_data['iterations'],
+                final_response=multi_agent_data['final_response'],
+                quality_score=multi_agent_data['quality_score'],
+                total_iterations=multi_agent_data['total_iterations'],
+                timestamp=datetime.fromisoformat(multi_agent_data['timestamp']),
+                context_used=multi_agent_data.get('context_used', '')
+            )
+        return cls(
+            id=data['id'],
+            user_id=data['user_id'],
+            timestamp=datetime.fromisoformat(data['timestamp']),
+            user_message=data['user_message'],
+            ai_response=data['ai_response'],
+            multi_agent_session=multi_agent_session,
+            context=data['context'],
+            sentiment=data['sentiment'],
+            topics=data['topics'],
+            potential_followups=data['potential_followups']
+        )
+
+
+@dataclass
+class Task:
+    id: str
+    conversation_id: str
+    task_type: str
+    description: str
+    priority: int
+    status: str
+    created_at: datetime
+    scheduled_for: datetime
+    result: Optional[str] = None
+    metadata: Optional[Dict] = None
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'conversation_id': self.conversation_id,
+            'task_type': self.task_type,
+            'description': self.description,
+            'priority': self.priority,
+            'status': self.status,
+            'created_at': self.created_at.isoformat(),
+            'scheduled_for': self.scheduled_for.isoformat(),
+            'result': self.result,
+            'metadata': self.metadata
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict):
+        return cls(
+            id=data['id'],
+            conversation_id=data['conversation_id'],
+            task_type=data['task_type'],
+            description=data['description'],
+            priority=data['priority'],
+            status=data['status'],
+            created_at=datetime.fromisoformat(data['created_at']),
+            scheduled_for=datetime.fromisoformat(data['scheduled_for']),
+            result=data.get('result'),
+            metadata=data.get('metadata')
+        )
+
+
+@dataclass
+class Document:
+    id: str
+    filename: str
+    content: str
+    file_type: str
+    file_size: int
+    upload_time: datetime
+    user_id: str
+    hash_value: str
+    metadata: Dict[str, Any]
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'filename': self.filename,
+            'content': self.content,
+            'file_type': self.file_type,
+            'file_size': self.file_size,
+            'upload_time': self.upload_time.isoformat(),
+            'user_id': self.user_id,
+            'hash_value': self.hash_value,
+            'metadata': self.metadata
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict):
+        return cls(
+            id=data['id'],
+            filename=data['filename'],
+            content=data['content'],
+            file_type=data['file_type'],
+            file_size=data['file_size'],
+            upload_time=datetime.fromisoformat(data['upload_time']),
+            user_id=data['user_id'],
+            hash_value=data['hash_value'],
+            metadata=data.get('metadata', {})
+        )
+
+
+# --- Custom Progress Bar ---
+class AnimatedProgressBar(ProgressBar):
+    """Custom animated progress bar with different styles for each stage"""
+
+    def __init__(self, style="green", pulse_style="grey50"):
+        super().__init__()
+        self.style = style
+        self.pulse_style = pulse_style
+        self._animation_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self._frame_index = 0
+
+    def get_animation_frame(self):
+        self._frame_index = (self._frame_index + 1) % len(self._animation_frames)
+        return self._animation_frames[self._frame_index]
+
+    def __get_ranges__(self, task):
+        total = task.total or 100
+        completed = task.completed
+        if total == 0:
+            return [(0, 1, self.pulse_style)]
+
+        width = self.width or 20
+        full = completed / total
+
+        # Add animation to the pulse style
+        animated_pulse = f"{self.get_animation_frame()} {self.pulse_style}"
+
+        ranges = [(0, full, self.style)]
+        if full < 1.0:
+            ranges.append((full, 1.0, animated_pulse))
+        return ranges
+
+
+# --- File Manager ---
+class TextFileManager:
+    def __init__(self, data_dir: str = "multi_agent_data"):
+        self.data_dir = Path(data_dir)
+        self.file_lock = Lock()
+        self.data_dir.mkdir(exist_ok=True)
+        self.conversations_file = self.data_dir / "conversations.json"
+        self.tasks_file = self.data_dir / "tasks.json"
+        self.documents_file = self.data_dir / "documents.json"
+        self.session_conversations_file = self.data_dir / "new_convo.json"
+        self._ensure_files_exist()
+        self._initialize_session_file()
+
+    def _ensure_files_exist(self):
+        for file_path in [self.conversations_file, self.tasks_file, self.documents_file]:
+            if not file_path.exists():
+                file_path.write_text("[]")
+
+    def cleanup_session_file(self):
+        """Clean up the session conversation file"""
+        try:
+            if self.session_conversations_file.exists():
+                self.session_conversations_file.unlink()
+                logger.info("Session conversation file cleaned up")
+        except Exception as e:
+            logger.error(f"Failed to cleanup session file: {e}")
+
+    def _read_json_file(self, file_path: Path) -> List[Dict]:
+        try:
+            with self.file_lock:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                    return json.loads(content) if content else []
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error in {file_path}: {e}")
+            backup_path = file_path.with_suffix('.backup')
+            file_path.rename(backup_path)
+            return []
+        except FileNotFoundError:
+            return []
+
+    def debug_context_flow(self, user_id: str):
+        """Debug method to check context flow"""
+        session_convs = self.get_session_conversations(user_id, 5)
+        all_convs = self.get_recent_conversations(user_id, 5)
+
+        print(f"Session conversations: {len(session_convs)}")
+        print(f"All conversations: {len(all_convs)}")
+
+        context = self.get_conversation_context(user_id, 5)
+        print(f"Context length: {len(context)} chars")
+        print(f"Context preview: {context[:200]}...")
+
+    def _write_json_file(self, file_path: Path, data: List[Dict]):
+        with self.file_lock:
+            try:
+                json_content = json.dumps(data, indent=2, ensure_ascii=False)
+                temp_path = file_path.with_suffix('.tmp')
+                with open(temp_path, 'w', encoding='utf-8') as temp_file:
+                    temp_file.write(json_content)
+                temp_path.replace(file_path)
+            except Exception as e:
+                logger.error(f"Failed to write {file_path}: {e}")
+                raise
+
+    def _initialize_session_file(self):
+        """Initialize or clear the session conversation file"""
+        try:
+            self.session_conversations_file.write_text("[]")
+            logger.info("Session conversation file initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize session file: {e}")
+
+    @log_errors
+    def save_conversation(self, conversation: Conversation):
+        conversations = self._read_json_file(self.conversations_file)
+        conversations = [c for c in conversations if c.get('id') != conversation.id]
+        conversations.append(conversation.to_dict())
+        conversations.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+        self._write_json_file(self.conversations_file, conversations)
+        # Save to session-specific new_convo.json
+        session_conversations = self._read_json_file(self.session_conversations_file)
+        session_conversations = [c for c in session_conversations if c.get('id') != conversation.id]
+        session_conversations.append(conversation.to_dict())
+        session_conversations.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+        self._write_json_file(self.session_conversations_file, session_conversations)
+
+    @log_errors
+    def save_conversations_batch(self, conversations: List[Conversation]):
+        conversations_data = [conv.to_dict() for conv in conversations]
+        self._write_json_file(self.conversations_file, conversations_data)
+
+    @log_errors
+    def get_session_conversations(self, user_id: str, limit: int = 70) -> List[Conversation]:
+        """Get conversations from current session only"""
+        session_data = self._read_json_file(self.session_conversations_file)
+        user_conversations = [c for c in session_data if c.get('user_id') == user_id]
+        user_conversations.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+        return [Conversation.from_dict(conv_data) for conv_data in user_conversations[:limit]]
+
+    @log_errors
+    def save_task(self, task: Task):
+        tasks = self._read_json_file(self.tasks_file)
+        tasks = [t for t in tasks if t.get('id') != task.id]
+        tasks.append(task.to_dict())
+        tasks.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+        self._write_json_file(self.tasks_file, tasks)
+
+    @log_errors
+    def get_recent_conversations(self, user_id: str, limit: int = 70) -> List[Conversation]:
+        conversations_data = self._read_json_file(self.conversations_file)
+        user_conversations = [c for c in conversations_data if c.get('user_id') == user_id]
+        user_conversations.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+        return [Conversation.from_dict(conv_data) for conv_data in user_conversations[:limit]]
+
+    @log_errors
+
+    def get_conversation_context(self, user_id: str, limit: int = 70) -> str:
+        # Get both session and historical conversations
+        session_conversations = self.get_session_conversations(user_id, limit // 2)  # Half from session
+        historical_conversations = self.get_recent_conversations(user_id, limit // 2)  # Half from history
+
+        # Remove duplicates (conversations that exist in both files)
+        historical_ids = {conv.id for conv in historical_conversations}
+        unique_session_convs = [conv for conv in session_conversations if conv.id not in historical_ids]
+
+        # Combine: recent session conversations + older historical conversations
+        all_conversations = unique_session_convs + historical_conversations
+        all_conversations.sort(key=lambda x: x.timestamp, reverse=True)
+        conversations = all_conversations[:limit]
+
+        if not conversations:
+            return "No previous conversation history available."
+
+        context_parts = ["=== 📜 CONVERSATION CONTEXT (Session + History) ==="]
+        for i, conv in enumerate(conversations):
+            # Mark source for clarity
+            source = "Current Session" if conv in unique_session_convs else "Previous Session"
+            context_parts.append(
+                f"\n--- Conversation {i + 1} ({conv.timestamp.strftime('%Y-%m-%d %H:%M')}) [{source}] ---")
+            context_parts.append(f"👤 USER: {conv.user_message}")
+            context_parts.append(f"🤖 ASSISTANT: {conv.ai_response}")
+
+            if conv.multi_agent_session:
+                session = conv.multi_agent_session
+                context_parts.append(f"[Quality: {session.quality_score:.2f} | Iterations: {session.total_iterations}]")
+
+            if conv.topics:
+                context_parts.append(f"[Topics: {', '.join(conv.topics)}]")
+
+        # Add document context if available
+        docs_context = self.get_documents_context(user_id, 7)
+        if docs_context:
+            context_parts.append(f"\n--- 📄 RELEVANT DOCUMENTS ---")
+            context_parts.append(docs_context)
+
+        context_parts.append("\n=== END OF CONTEXT ===")
+        return "\n".join(context_parts)
+
+    @log_errors
+    def get_pending_tasks(self) -> List[Task]:
+        tasks_data = self._read_json_file(self.tasks_file)
+        now = datetime.now()
+        pending_tasks = []
+        for task_data in tasks_data:
+            try:
+                if task_data.get('status') == 'pending' and datetime.fromisoformat(
+                        task_data.get('scheduled_for', '')) <= now:
+                    pending_tasks.append(Task.from_dict(task_data))
+            except Exception as e:
+                logger.warning(f"Skipping malformed task data: {e}")
+        pending_tasks.sort(key=lambda x: (-x.priority, x.scheduled_for))
+        return pending_tasks
+
+    @log_errors
+    def get_storage_stats(self) -> Dict[str, Any]:
+        conversations_data = self._read_json_file(self.conversations_file)
+        tasks_data = self._read_json_file(self.tasks_file)
+        documents_data = self._read_json_file(self.documents_file)
+        user_stats = {}
+        for conv in conversations_data:
+            user_id = conv.get('user_id', 'unknown')
+            user_stats[user_id] = user_stats.get(user_id, 0) + 1
+        return {
+            'total_conversations': len(conversations_data),
+            'total_tasks': len(tasks_data),
+            'total_documents': len(documents_data),
+            'users': user_stats,
+            'oldest_conversation': min([c.get('timestamp', '') for c in conversations_data], default='none'),
+            'newest_conversation': max([c.get('timestamp', '') for c in conversations_data], default='none'),
+            'files_exist': {
+                'conversations': self.conversations_file.exists(),
+                'tasks': self.tasks_file.exists(),
+                'documents': self.documents_file.exists(),
+            'session_conversations': len(self._read_json_file(self.session_conversations_file)),
+            'session_file_exists': self.session_conversations_file.exists(),
+            }
+        }
+
+    @log_errors
+    def save_document(self, document: Document):
+        documents = self._read_json_file(self.documents_file)
+        documents = [d for d in documents if d.get('id') != document.id]
+        documents.append(document.to_dict())
+        documents.sort(key=lambda x: x.get('upload_time', ''), reverse=True)
+        self._write_json_file(self.documents_file, documents)
+        logger.info(f"Document saved: {document.filename}")
+
+    @log_errors
+    def get_user_documents(self, user_id: str, limit: int = 20) -> List[Document]:
+        documents_data = self._read_json_file(self.documents_file)
+        user_docs = [d for d in documents_data if d.get('user_id') == user_id]
+        user_docs.sort(key=lambda x: x.get('upload_time', ''), reverse=True)
+        return [Document.from_dict(doc_data) for doc_data in user_docs[:limit]]
+
+    @log_errors
+    def delete_document(self, document_id: str, user_id: str) -> bool:
+        try:
+            documents = self._read_json_file(self.documents_file)
+            original_count = len(documents)
+            documents = [d for d in documents if not (d.get('id') == document_id and d.get('user_id') == user_id)]
+            if len(documents) < original_count:
+                self._write_json_file(self.documents_file, documents)
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Failed to delete document: {e}")
+            return False
+
+    @log_errors
+    def get_documents_context(self, user_id: str, limit: int = 5) -> str:
+        documents = self.get_user_documents(user_id, limit)
+        if not documents:
+            return ""
+
+        context_parts = []
+        for i, doc in enumerate(documents):
+            context_parts.append(f"\n--- Document {i + 1}: {doc.filename} ---")
+            content_preview = doc.content[:500] + "..." if len(doc.content) > 500 else doc.content
+            context_parts.append(content_preview)
+
+        return "\n".join(context_parts)
+
+    @log_errors
+    def process_uploaded_file(self, file_path: str, user_id: str) -> Optional[Document]:
+        try:
+            file_path = Path(file_path)
+            if not file_path.exists():
+                return None
+
+            file_type = mimetypes.guess_type(file_path)[0] or 'text/plain'
+            content = ""
+
+            if file_type.startswith('text/'):
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+            elif file_type == 'application/pdf':
+                content = "[PDF content extracted - full text available for context]"
+            elif file_type == 'text/markdown':
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+            elif file_type == 'text/csv':
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+            else:
+                content = f"[Binary file: {file_path.name} - content not extractable]"
+
+            with open(file_path, 'rb') as f:
+                file_hash = hashlib.md5(f.read()).hexdigest()
+
+            file_size = file_path.stat().st_size
+            document = Document(
+                id=f"{user_id}_{int(time.time())}_{file_hash[:8]}",
+                filename=file_path.name,
+                content=content,
+                file_type=file_type,
+                file_size=file_size,
+                upload_time=datetime.now(),
+                user_id=user_id,
+                hash_value=file_hash,
+                metadata={
+                    'original_path': str(file_path),
+                    'processed_at': datetime.now().isoformat()
+                }
+            )
+            self.save_document(document)
+            return document
+        except Exception as e:
+            logger.error(f"Error processing file {file_path}: {e}")
+            return None
+
+
+# --- AI Agent ---
+class AIAgent:
+    def __init__(self, api_key: str, role: AgentRole, temperature: float = 0.7):
+        genai.configure(api_key=api_key)
+        self.role = role
+        self.model = genai.GenerativeModel(
+            model_name='gemini-1.5-flash',
+            generation_config={
+                "temperature": temperature,
+                "top_p": 0.8,
+                "top_k": 40,
+                "max_output_tokens": 2048,
+            }
+        )
+
+    @log_errors
+    async def process(self, user_query: str, context: str = "", previous_iteration: Dict = None) -> AgentResponse:
+        if self.role == AgentRole.GENERATOR:
+            return await self._generate_solution(user_query, context)
+        elif self.role == AgentRole.ANALYZER:
+            return await self._analyze_solution(user_query, context, previous_iteration)
+        elif self.role == AgentRole.OPTIMIZER:
+            return await self._optimize_solution(user_query, context, previous_iteration)
+        elif self.role == AgentRole.VALIDATOR:
+            return await self._validate_solution(user_query, context, previous_iteration)
+
+    @log_errors
+    async def _generate_solution(self, user_query: str, context: str) -> AgentResponse:
+        prompt = f"""
+        Role: Solution Generator Agent
+        Task: Provide a comprehensive initial solution to the user's query using conversation history.
+        
+        IMPORTANT: Read the context carefully and refer to previous conversations to understand what the user is asking about.
+
+        📜 CONTEXT:
+        {context}
+
+        👤 USER QUERY: {user_query}
+
+        Instructions:
+        1. FIRST: Review the conversation history above to understand what was previously discussed
+        2. If the current query refers to something mentioned before (like "another way" or "indian style"), connect it to the previous topic
+        3. Provide a detailed response that builds on the conversation history
+        4. Reference specific points from previous exchanges when relevant
+        5. Provide a detailed, well-structured response that naturally incorporates relevant context
+        6. Reference specific points from the context when relevant
+        7. Make the response feel complete and self-contained
+        8. Include practical examples where relevant
+        9. Consider multiple approaches if applicable
+        10. Be thorough but clear
+        11. Rate your confidence in this solution (0-1)
+        """
+        try:
+            response = await self.model.generate_content_async(prompt)
+            return AgentResponse(
+                agent_role=self.role,
+                content=response.text,
+                confidence=0.8,
+                suggestions=[],
+                errors_found=[],
+                improvements=[],
+                metadata={"context_length": len(context)}
+            )
+        except Exception as e:
+            logger.error(f"Error in _generate_solution: {e}")
+            return AgentResponse(
+                agent_role=self.role,
+                content=f"Error generating solution: {e}",
+                confidence=0.5,
+                suggestions=[],
+                errors_found=[str(e)],
+                improvements=[],
+                metadata={"error": str(e)}
+            )
+
+    @log_errors
+    async def _analyze_solution(self, user_query: str, context: str, previous_iteration: Dict) -> AgentResponse:
+        generator_response = previous_iteration.get("generator_response", {})
+        solution = generator_response.get("content", "")
+
+        prompt = f"""
+        Role: Critical Analyzer Agent
+        Task: Analyze the provided solution for errors, gaps, and improvements, considering conversation history.
+
+        📜 CONTEXT:
+        {context}
+
+        👤 ORIGINAL USER QUERY: {user_query}
+
+        🤖 SOLUTION TO ANALYZE:
+        {solution}
+
+        Instructions:
+        1. Review the conversation history to understand the full context
+        2. Check if the solution properly addresses the user's query in context of previous conversations
+        3. Identify factual errors or inaccuracies
+        4. Find logical inconsistencies
+        5. Spot missing information or gaps
+        6. Check if the solution maintains conversational continuity
+        7. Verify if previous relevant information was properly considered
+        8. Suggest areas for improvement
+        9. Rate the overall quality (0-1)
+        10. Be thorough but constructive
+
+        Format your response as JSON:
+        {{
+            "analysis": "Your detailed analysis",
+            "errors_found": ["error1", "error2"],
+            "gaps_identified": ["gap1", "gap2"],
+            "improvements_needed": ["improvement1", "improvement2"],
+            "quality_score": 0.75,
+            "strengths": ["strength1", "strength2"],
+            "recommendations": ["rec1", "rec2"],
+            "context_adherence": 0.8,
+            "continuity_score": 0.7
+        }}
+        """
+        try:
+            response = await self.model.generate_content_async(prompt)
+            response_text = response.text.strip()
+            if response_text.startswith('```json'):
+                response_text = response_text[7:-3]
+            elif response_text.startswith('```'):
+                response_text = response_text[3:-3]
+            data = json.loads(response_text)
+            return AgentResponse(
+                agent_role=self.role,
+                content=data.get("analysis", response_text),
+                confidence=data.get("quality_score", 0.7),
+                suggestions=data.get("recommendations", []),
+                errors_found=data.get("errors_found", []),
+                improvements=data.get("improvements_needed", []),
+                metadata=data
+            )
+        except Exception as e:
+            logger.error(f"Analyzer agent error: {e}")
+            return AgentResponse(
+                agent_role=self.role,
+                content="Analysis completed with some limitations.",
+                confidence=0.6,
+                suggestions=[],
+                errors_found=[],
+                improvements=[],
+                metadata={"error": str(e)}
+            )
+
+    @log_errors
+    async def _optimize_solution(self, user_query: str, context: str, previous_iteration: Dict) -> AgentResponse:
+        generator_response = previous_iteration.get("generator_response", {})
+        analyzer_response = previous_iteration.get("analyzer_response", {})
+        original_solution = generator_response.get("content", "")
+        analysis = analyzer_response.get("content", "")
+        errors = analyzer_response.get("errors_found", [])
+        improvements = analyzer_response.get("improvements", [])
+
+        prompt = f"""
+        Role: Solution Optimizer Agent
+        Task: Create an improved solution based on analysis feedback and conversation history.
+
+        📜 CONTEXT:
+        {context}
+
+        👤 ORIGINAL USER QUERY: {user_query}
+
+        🤖 ORIGINAL SOLUTION:
+        {original_solution}
+
+        🔍 ANALYSIS FEEDBACK:
+        {analysis}
+
+        ❌ IDENTIFIED ERRORS:
+        {errors}
+
+        💡 SUGGESTED IMPROVEMENTS:
+        {improvements}
+
+        Instructions:
+        1. Review the conversation history to maintain context and continuity
+        2. Fix all identified errors
+        3. Address the gaps and improvements
+        4. Enhance clarity and completeness
+        5. Provide a significantly improved solution
+        6. Reference specific improvements made
+
+        Format your response as JSON:
+        {{
+            "optimized_solution": "Your improved solution here",
+            "changes_made": ["change1", "change2"],
+            "errors_fixed": ["fix1", "fix2"],
+            "enhancements": ["enhancement1", "enhancement2"],
+            "confidence": 0.95,
+            "context_integration": "How previous conversations were integrated"
+        }}
+        """
+        try:
+            response = await self.model.generate_content_async(prompt)
+            response_text = response.text.strip()
+            if response_text.startswith('```json'):
+                response_text = response_text[7:-3]
+            data = json.loads(response_text)
+            return AgentResponse(
+                agent_role=self.role,
+                content=data.get("optimized_solution", response_text),
+                confidence=data.get("confidence", 0.9),
+                suggestions=data.get("enhancements", []),
+                errors_found=[],
+                improvements=data.get("changes_made", []),
+                metadata=data
+            )
+        except Exception as e:
+            logger.error(f"Optimizer agent error: {e}")
+            return AgentResponse(
+                agent_role=self.role,
+                content=original_solution,
+                confidence=0.7,
+                suggestions=[],
+                errors_found=[],
+                improvements=[],
+                metadata={"error": str(e)}
+            )
+
+    @log_errors
+    async def _validate_solution(self, user_query: str, context: str, previous_iteration: Dict) -> AgentResponse:
+        optimizer_response = previous_iteration.get("optimizer_response", {})
+        solution = optimizer_response.get("content", "")
+
+        prompt = f"""
+        Role: Validator Agent
+        Task: Validate the final solution for accuracy and completeness.
+
+        📜 CONTEXT:
+        {context}
+
+        👤 USER QUERY: {user_query}
+
+        🤖 SOLUTION TO VALIDATE:
+        {solution}
+
+        Instructions:
+        1. Check for factual accuracy
+        2. Ensure the solution fully addresses the user query
+        3. Verify all claims can be supported by the context
+        4. Check for logical consistency
+        5. Rate confidence (0-1)
+        6. Provide specific validation feedback
+        """
+        try:
+            response = await self.model.generate_content_async(prompt)
+            return AgentResponse(
+                agent_role=self.role,
+                content=response.text,
+                confidence=0.9,
+                suggestions=[],
+                errors_found=[],
+                improvements=[],
+                metadata={"validation": "passed"}
+            )
+        except Exception as e:
+            logger.error(f"Validator agent error: {e}")
+            return AgentResponse(
+                agent_role=self.role,
+                content=f"Validation error: {e}",
+                confidence=0.5,
+                suggestions=[],
+                errors_found=[str(e)],
+                improvements=[],
+                metadata={"error": str(e)}
+            )
+
+
+# --- Multi-Agent System ---
+class MultiAgentSystem:
+    def __init__(self, api_key: str):
+        self.generator = AIAgent(api_key, AgentRole.GENERATOR, temperature=0.8)
+        self.analyzer = AIAgent(api_key, AgentRole.ANALYZER, temperature=0.3)
+        self.optimizer = AIAgent(api_key, AgentRole.OPTIMIZER, temperature=0.5)
+        self.validator = AIAgent(api_key, AgentRole.VALIDATOR, temperature=0.2)
+        self.max_iterations = 3
+        self.quality_threshold = 0.85
+        self.use_validator = True
+
+    @log_errors
+    async def process_query(self, user_query: str, context: str = "",
+                            progress_callback: Optional[Callable] = None) -> MultiAgentSession:
+        session_id = f"session_{int(time.time())}"
+        iterations = []
+        current_iteration = 0
+        final_response = ""
+        quality_score = 0.0
+
+        # Show context being used
+        if progress_callback:
+            progress_callback("context", 0, f"📜 Using context ({len(context.split()) if context else 0} words)")
+
+        while current_iteration < self.max_iterations:
+            iteration_data = {"iteration": current_iteration + 1, "timestamp": datetime.now().isoformat()}
+
+            # Generator Agent
+            if progress_callback:
+                progress_callback("generator", 20 + (current_iteration * 25),
+                                  "🔧 Generator Agent creating initial solution...")
+            generator_response = await self.generator.process(user_query, context,
+                                                              iterations[-1] if iterations else None)
+            iteration_data["generator_response"] = asdict(generator_response)
+
+            # Analyzer Agent
+            if progress_callback:
+                progress_callback("analyzer", 35 + (current_iteration * 25), "🔍 Analyzer Agent reviewing for errors...")
+            analyzer_response = await self.analyzer.process(user_query, context, iteration_data)
+            iteration_data["analyzer_response"] = asdict(analyzer_response)
+
+            # Optimizer Agent
+            if progress_callback:
+                progress_callback("optimizer", 50 + (current_iteration * 25), "⚡ Optimizer Agent refining solution...")
+            optimizer_response = await self.optimizer.process(user_query, context, iteration_data)
+            iteration_data["optimizer_response"] = asdict(optimizer_response)
+
+            # Validator Agent
+            if self.use_validator:
+                if progress_callback:
+                    progress_callback("validator", 75 + (current_iteration * 25),
+                                      "✅ Validator Agent validating solution...")
+                validator_response = await self.validator.process(user_query, context, iteration_data)
+                iteration_data["validator_response"] = asdict(validator_response)
+
+            iterations.append(iteration_data)
+            final_response = optimizer_response.content
+            quality_score = optimizer_response.confidence
+
+            if quality_score >= self.quality_threshold or not analyzer_response.errors_found:
+                break
+            current_iteration += 1
+
+        return MultiAgentSession(
+            session_id=session_id,
+            user_query=user_query,
+            iterations=iterations,
+            final_response=final_response,
+            quality_score=quality_score,
+            total_iterations=len(iterations),
+            timestamp=datetime.now(),
+            context_used=context[:1000] + "..." if len(context) > 1000 else context
+        )
+
+
+# --- Autonomous Assistant ---
+class AutonomousMultiAgentAssistant:
+    def __init__(self, gemini_api_key: str):
+        self.console = Console()
+        self.file_manager = TextFileManager()
+        self.multi_agent_system = MultiAgentSystem(gemini_api_key)
+        self.running = False
+        self.task_executor_thread = None
+        self._cached_context = {}
+
+    def start(self):
+        self.running = True
+        self.task_executor_thread = threading.Thread(target=self._task_executor_loop, daemon=True)
+        self.task_executor_thread.start()
+
+    def stop(self):
+        self.file_manager.cleanup_session_file()
+        self.running = False
+        if self.task_executor_thread:
+            self.task_executor_thread.join(timeout=5)
+
+    def get_cached_context(self, user_id: str) -> str:
+        # Always get fresh context to include latest session conversations
+        return self.file_manager.get_conversation_context(user_id, 70)
+
+    def clear_cached_context(self, user_id: str):
+        self._cached_context.pop(user_id, None)
+
+    @log_errors
+    async def process_user_message(self, user_id: str, message: str, reset_context: bool = False,
+                                   progress_callback: Optional[Callable] = None) -> str:
+        if reset_context:
+            self.clear_cached_context(user_id)
+
+        # Always get fresh context instead of cached for session conversations
+        context = self.file_manager.get_conversation_context(user_id, 70)
+
+        # Debug: Print context being used (remove in production)
+        print(f"DEBUG: Using context with {len(context.split())} words")
+
+        multi_agent_session = await self.multi_agent_system.process_query(
+            message,
+            context,
+            progress_callback=progress_callback
+        )
+
+
+        conversation_id = f"{user_id}_{int(time.time())}"
+        conversation = Conversation(
+            id=conversation_id,
+            user_id=user_id,
+            timestamp=datetime.now(),
+            user_message=message,
+            ai_response=multi_agent_session.final_response,
+            multi_agent_session=multi_agent_session,
+            context=context[:2000] + "..." if len(context) > 2000 else context,
+            sentiment="neutral",
+            topics=[],
+            potential_followups=[]
+        )
+        self.file_manager.save_conversation(conversation)
+        await self._analyze_and_create_tasks(conversation)
+        return multi_agent_session.final_response
+
+    @log_errors
+    async def _analyze_and_create_tasks(self, conversation: Conversation):
+        suggested_tasks = []
+        user_message = conversation.user_message.lower()
+
+        if "smart home" in user_message:
+            suggested_tasks = [
+                "Research latest smart thermostat models and energy savings",
+                "Compare smart lighting systems within 500-800 budget range"
+            ]
+        elif "sensors" in user_message:
+            suggested_tasks = [
+                "Research motion sensors for smart lighting automation",
+                "Compare ambient light sensors for energy efficiency"
+            ]
+        elif "python" in user_message or "code" in user_message:
+            suggested_tasks = [
+                f"Find Python code examples related to: {conversation.user_message[:50]}",
+                f"Explain best practices for: {conversation.user_message[:50]}"
+            ]
+        elif "machine learning" in user_message:
+            suggested_tasks = [
+                f"Research latest developments in: {conversation.user_message[:50]}",
+                f"Find practical applications of: {conversation.user_message[:50]}"
+            ]
+
+        for i, task_desc in enumerate(suggested_tasks):
+            task_id = f"{conversation.id}_task_{i}"
+            schedule_delay = timedelta(minutes=2 + (i * 3))
+            task = Task(
+                id=task_id,
+                conversation_id=conversation.id,
+                task_type="research",
+                description=task_desc,
+                priority=2,
+                status="pending",
+                created_at=datetime.now(),
+                scheduled_for=datetime.now() + schedule_delay,
+                metadata={"user_id": conversation.user_id}
+            )
+            self.file_manager.save_task(task)
+
+    @log_errors
+    def _task_executor_loop(self):
+        while self.running:
+            try:
+                pending_tasks = self.file_manager.get_pending_tasks()
+                for task in pending_tasks[:2]:
+                    asyncio.run(self._execute_task_async(task))
+                time.sleep(45)
+            except Exception as e:
+                logger.error(f"Task executor error: {e}")
+                time.sleep(60)
+
+    @log_errors
+    async def _execute_task_async(self, task: Task):
+        try:
+            task.status = "in_progress"
+            self.file_manager.save_task(task)
+
+            context = ""
+            if task.metadata and 'user_id' in task.metadata:
+                context = self.file_manager.get_conversation_context(task.metadata['user_id'], 3)
+
+            session = await self.multi_agent_system.process_query(
+                f"Research and provide information about: {task.description}", context
+            )
+            task.result = session.final_response
+            task.status = "completed"
+            task.metadata["quality_score"] = session.quality_score
+            task.metadata["iterations"] = session.total_iterations
+            self.file_manager.save_task(task)
+        except Exception as e:
+            logger.error(f"Task execution error: {e}")
+            task.status = "failed"
+            task.result = f"Error: {str(e)}"
+            self.file_manager.save_task(task)
+
+    @log_errors
+    def get_user_insights(self, user_id: str) -> Dict[str, Any]:
+        conversations = self.file_manager.get_recent_conversations(user_id, 70)
+        if not conversations:
+            return {"message": "No conversation history found"}
+
+        quality_scores = []
+        total_iterations = []
+        context_usage = []
+        for conv in conversations:
+            if conv.multi_agent_session:
+                quality_scores.append(conv.multi_agent_session.quality_score)
+                total_iterations.append(conv.multi_agent_session.total_iterations)
+                context_usage.append(len(conv.context) > 100)
+
+        avg_quality = sum(quality_scores) / len(quality_scores) if quality_scores else 0
+        avg_iterations = sum(total_iterations) / len(total_iterations) if total_iterations else 0
+        context_usage_rate = sum(context_usage) / len(context_usage) if context_usage else 0
+
+        return {
+            "total_conversations": len(conversations),
+            "multi_agent_sessions": len([c for c in conversations if c.multi_agent_session]),
+            "average_quality_score": round(avg_quality, 2),
+            "average_iterations": round(avg_iterations, 1),
+            "highest_quality": max(quality_scores) if quality_scores else 0,
+            "context_usage_rate": round(context_usage_rate * 100, 1),
+            "topics": self._extract_topics(conversations),
+            "last_interaction": conversations[0].timestamp.isoformat() if conversations else None,
+            "conversation_file_status": "Active" if self.file_manager.conversations_file.exists() else "Missing"
+        }
+
+    def _extract_topics(self, conversations: List[Conversation]) -> List[str]:
+        all_topics = []
+        for conv in conversations:
+            all_topics.extend(conv.topics)
+        topic_counts = {}
+        for topic in all_topics:
+            topic_counts[topic] = topic_counts.get(topic, 0) + 1
+        return sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+
+
+# --- Rich CLI ---
+class RichMultiAgentCLI:
+    def __init__(self, api_key: str):
+        self.console = Console()
+        self.assistant = AutonomousMultiAgentAssistant(api_key)
+        self.user_id = "default_user"
+        self.conversation_count = 0
+        self.session_start = datetime.now()
+        self.command_aliases = {
+            'q': 'quit', 'exit': 'quit',
+            'c': 'chat',
+            'i': 'insights',
+            't': 'tasks',
+            'd': 'docs',
+            'h': 'help',
+            'b': 'back'
+        }
+        # Custom progress bar styles
+        self.progress_styles = {
+            "context": Style(color="yellow", blink=False, bold=True),
+            "generator": Style(color="green", blink=False, bold=True),
+            "analyzer": Style(color="yellow", blink=False, bold=True),
+            "optimizer": Style(color="blue", blink=False, bold=True),
+            "validator": Style(color="cyan", blink=False, bold=True),
+            "complete": Style(color="green", blink=True, bold=True),
+            "error": Style(color="red", blink=True, bold=True)
+        }
+
+    def display_banner(self):
+        banner_text = """
+        [bold cyan]🤖 MULTI-AGENT AUTONOMOUS ASSISTANT 🤖[/bold cyan]
+        [dim]Enhanced with Animated Progress Tracking and Context Awareness[/dim]
+        """
+        self.console.print(Align.center(Panel(banner_text, border_style="bold cyan", padding=(1, 2))))
+
+    def display_help(self):
+        help_text = """
+        [bold magenta]📋 Available Commands:[/bold magenta]
+        • [bold green]chat[/bold green]       Start a conversation (type [bold red]back[/bold red] to exit)
+        • [bold green]insights[/bold green]   View user interaction statistics
+        • [bold green]docs[/bold green]       Manage uploaded documents
+        • [bold green]tasks[/bold green]      Show autonomous tasks and status
+        • [bold green]quality[/bold green]    Display recent quality scores
+        • [bold green]agents[/bold green]     Show multi-agent architecture
+        • [bold green]context[/bold green]    Preview conversation context
+        • [bold green]files[/bold green]      Check data file status
+        • [bold green]stats[/bold green]      System performance statistics
+        • [bold green]clear[/bold green]      Clear the console screen
+        • [bold green]help[/bold green]       Show this help menu
+        • [bold red]quit[/bold red]          Exit the application
+
+        [dim]Type 'back' to return to main menu from any command.[/dim]
+        [bold yellow]⚠️ Note:[/bold yellow] The system uses conversation history and uploaded documents
+        to provide more accurate and context-aware responses.
+        """
+        self.console.print(Panel(help_text, border_style="magenta", padding=(1, 2)))
+
+    def create_progress(self, description: str = "Processing...") -> Progress:
+        """Create a progress bar with custom animated styling"""
+        return Progress(
+            TextColumn("[bold cyan]{task.description}", justify="right"),
+            BarColumn(
+                bar_width=30,
+                pulse_style=self.progress_styles["context"],
+                complete_style="green",
+                finished_style="green"
+                # Removed animation_time parameter as it's not supported
+            ),
+            MofNCompleteColumn(),
+            TimeRemainingColumn(),
+            TimeElapsedColumn(),
+            console=self.console,
+            auto_refresh=True,
+            refresh_per_second=20  # Smoother animation
+        )
+
+    def display_agents(self):
+        """Display multi-agent architecture info"""
+        agents_info = """
+        [bold cyan]🤖 Multi-Agent Architecture:[/bold cyan]
+        • [bold green]Generator Agent[/bold green]: Creates initial solutions (temp: 0.8)
+        • [bold yellow]Analyzer Agent[/bold yellow]: Reviews for errors (temp: 0.3)  
+        • [bold blue]Optimizer Agent[/bold blue]: Refines solutions (temp: 0.5)
+        • [bold cyan]Validator Agent[/bold cyan]: Validates accuracy (temp: 0.2)
+        """
+        self.console.print(Panel(agents_info, border_style="cyan"))
+
+    def display_tasks(self):
+        """Display autonomous tasks and their status"""
+        progress = self.create_progress()
+        task = progress.add_task("[bold cyan]⚙️ Loading tasks...[/bold cyan]", total=100)
+
+        with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+            # Animate to 30%
+            current_percent = 0
+            while current_percent < 30:
+                current_percent += 2
+                progress.update(task, completed=current_percent)
+                time.sleep(0.03)
+
+            # Get pending and recent tasks
+            pending_tasks = self.assistant.file_manager.get_pending_tasks()
+            all_tasks_data = self.assistant.file_manager._read_json_file(self.assistant.file_manager.tasks_file)
+            progress.update(task, completed=60, description="[bold cyan]⚙️ Analyzing task queue...[/bold cyan]")
+
+            current_percent = 60
+            while current_percent < 80:
+                current_percent += 1
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            # Filter recent tasks (last 20)
+            recent_tasks = sorted(all_tasks_data, key=lambda x: x.get('created_at', ''), reverse=True)[:20]
+
+            # Create tasks table
+            tasks_table = Table(
+                show_header=True,
+                header_style="bold cyan",
+                box=ROUNDED,
+                title="Autonomous Tasks Status"
+            )
+            tasks_table.add_column("ID", style="dim", width=8)
+            tasks_table.add_column("Status", style="bold", width=12)
+            tasks_table.add_column("Priority", justify="center", style="bold magenta", width=8)
+            tasks_table.add_column("Type", style="white", width=12)
+            tasks_table.add_column("Description", style="green", width=40)
+            tasks_table.add_column("Scheduled", style="dim", width=12)
+
+            # Add tasks to table
+            for task_data in recent_tasks:
+                status_color = {
+                    'pending': '[yellow]⏳ Pending[/yellow]',
+                    'in_progress': '[blue]🔄 Running[/blue]',
+                    'completed': '[green]✅ Done[/green]',
+                    'failed': '[red]❌ Failed[/red]'
+                }.get(task_data.get('status', 'unknown'), '[dim]❓ Unknown[/dim]')
+
+                priority = task_data.get('priority', 0)
+                priority_display = f"🔥 {priority}" if priority >= 3 else f"📌 {priority}" if priority >= 2 else f"📋 {priority}"
+
+                scheduled_time = task_data.get('scheduled_for', '')
+                if scheduled_time:
+                    try:
+                        scheduled_dt = datetime.fromisoformat(scheduled_time)
+                        scheduled_display = scheduled_dt.strftime("%m-%d %H:%M")
+                    except:
+                        scheduled_display = "Invalid"
+                else:
+                    scheduled_display = "Not set"
+
+                tasks_table.add_row(
+                    task_data.get('id', 'N/A').split('_')[-1][:8],
+                    status_color,
+                    priority_display,
+                    task_data.get('task_type', 'unknown'),
+                    (task_data.get('description', 'No description')[:37] + "..." if len(
+                        task_data.get('description', '')) > 40 else task_data.get('description', 'No description')),
+                    scheduled_display
+                )
+
+            # Complete animation
+            while current_percent < 100:
+                current_percent += 1
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            progress.update(task, completed=100, description="[bold green]✓ Tasks loaded![/bold green]")
+
+        # Display results
+        self.console.print(Panel(
+            tasks_table,
+            title="[bold cyan]⚙️ Autonomous Tasks[/bold cyan]",
+            border_style="cyan",
+            padding=(1, 1)
+        ))
+
+        # Task summary
+        status_counts = {}
+        for task_data in all_tasks_data:
+            status = task_data.get('status', 'unknown')
+            status_counts[status] = status_counts.get(status, 0) + 1
+
+        summary_text = f"""
+        [bold]📊 Task Summary:[/bold]
+        • Total Tasks: [bold]{len(all_tasks_data)}[/bold]
+        • Pending: [bold yellow]{status_counts.get('pending', 0)}[/bold yellow]
+        • Completed: [bold green]{status_counts.get('completed', 0)}[/bold green]
+        • Failed: [bold red]{status_counts.get('failed', 0)}[/bold red]
+        • Active Queue: [bold]{len(pending_tasks)} ready to execute[/bold]
+        """
+        self.console.print(Panel(summary_text, border_style="blue", padding=(1, 2)))
+
+    def display_quality(self):
+        """Display recent quality scores and metrics"""
+        progress = self.create_progress()
+        task = progress.add_task("[bold cyan]📈 Analyzing quality...[/bold cyan]", total=100)
+
+        with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+            # Animate to 40%
+            current_percent = 0
+            while current_percent < 40:
+                current_percent += 2
+                progress.update(task, completed=current_percent)
+                time.sleep(0.03)
+
+            # Get recent conversations with multi-agent sessions
+            conversations = self.assistant.file_manager.get_recent_conversations(self.user_id, 10)
+            progress.update(task, completed=70, description="[bold cyan]📈 Computing quality metrics...[/bold cyan]")
+
+            current_percent = 70
+            while current_percent < 90:
+                current_percent += 1
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            # Filter conversations with multi-agent sessions
+            quality_sessions = []
+            for conv in conversations:
+                if conv.multi_agent_session:
+                    quality_sessions.append({
+                        'timestamp': conv.timestamp,
+                        'quality_score': conv.multi_agent_session.quality_score,
+                        'iterations': conv.multi_agent_session.total_iterations,
+                        'query': conv.user_message[:50] + "..." if len(conv.user_message) > 50 else conv.user_message,
+                        'session_id': conv.multi_agent_session.session_id
+                    })
+
+            # Complete animation
+            while current_percent < 100:
+                current_percent += 1
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            progress.update(task, completed=100, description="[bold green]✓ Quality analysis complete![/bold green]")
+
+        if not quality_sessions:
+            self.console.print(Panel(
+                "[yellow]No multi-agent sessions found for quality analysis[/yellow]",
+                title="[bold]📈 Quality Metrics[/bold]",
+                border_style="yellow"
+            ))
+            return
+
+        # Create quality table
+        quality_table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            box=ROUNDED,
+            title="Recent Quality Scores"
+        )
+        quality_table.add_column("Session", style="dim", width=12)
+        quality_table.add_column("Quality", justify="center", style="bold", width=10)
+        quality_table.add_column("Iterations", justify="center", style="bold magenta", width=10)
+        quality_table.add_column("Query", style="green", width=35)
+        quality_table.add_column("Timestamp", style="dim", width=12)
+
+        # Add quality sessions to table
+        for session in quality_sessions:
+            # Color code quality scores
+            score = session['quality_score']
+            if score >= 0.85:
+                quality_display = f"[bold green]{score:.2f}[/bold green] 🔥"
+            elif score >= 0.70:
+                quality_display = f"[bold yellow]{score:.2f}[/bold yellow] 📈"
+            else:
+                quality_display = f"[bold red]{score:.2f}[/bold red] ⚠️"
+
+            # Color code iterations
+            iterations = session['iterations']
+            iter_display = f"[green]{iterations}[/green]" if iterations <= 2 else f"[yellow]{iterations}[/yellow]" if iterations <= 3 else f"[red]{iterations}[/red]"
+
+            quality_table.add_row(
+                session['session_id'].split('_')[-1][:8],
+                quality_display,
+                iter_display,
+                session['query'],
+                session['timestamp'].strftime("%m-%d %H:%M")
+            )
+
+        # Display results
+        self.console.print(Panel(
+            quality_table,
+            title="[bold cyan]📈 Quality Metrics[/bold cyan]",
+            border_style="cyan",
+            padding=(1, 1)
+        ))
+
+        # Quality statistics
+        if quality_sessions:
+            scores = [s['quality_score'] for s in quality_sessions]
+            iterations = [s['iterations'] for s in quality_sessions]
+
+            avg_quality = sum(scores) / len(scores)
+            max_quality = max(scores)
+            min_quality = min(scores)
+            avg_iterations = sum(iterations) / len(iterations)
+
+            quality_trend = "📈 Improving" if len(scores) >= 3 and scores[0] > scores[-1] else "📊 Stable" if len(
+                scores) >= 3 else "🔍 Analyzing"
+
+            stats_text = f"""
+            [bold]📊 Quality Statistics:[/bold]
+            • Average Quality: [bold]{avg_quality:.2f}[/bold] ({quality_trend})
+            • Highest Score: [bold green]{max_quality:.2f}[/bold green]
+            • Lowest Score: [bold red]{min_quality:.2f}[/bold red]
+            • Avg Iterations: [bold]{avg_iterations:.1f}[/bold]
+            • Sessions Analyzed: [bold]{len(quality_sessions)}[/bold]
+            • Quality Threshold: [bold]0.85[/bold] (system target)
+            """
+            self.console.print(Panel(stats_text, border_style="green", padding=(1, 2)))
+
+    def display_files(self):
+        """Display data file status and information"""
+        progress = self.create_progress()
+        task = progress.add_task("[bold cyan]📁 Checking file status...[/bold cyan]", total=100)
+
+        with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+            # Animate to 40%
+            current_percent = 0
+            while current_percent < 40:
+                current_percent += 2
+                progress.update(task, completed=current_percent)
+                time.sleep(0.03)
+
+            # Get file stats
+            stats = self.assistant.file_manager.get_storage_stats()
+            progress.update(task, completed=70, description="[bold cyan]📁 Analyzing file system...[/bold cyan]")
+
+            current_percent = 70
+            while current_percent < 90:
+                current_percent += 1
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            # Create file status table
+            files_table = Table(
+                show_header=True,
+                header_style="bold cyan",
+                box=ROUNDED,
+                title="Data File Status"
+            )
+            files_table.add_column("File", style="bold white", width=20)
+            files_table.add_column("Status", style="bold", width=10)
+            files_table.add_column("Records", justify="right", style="bold magenta", width=10)
+            files_table.add_column("Location", style="dim", width=30)
+
+            # File status with color coding
+            for file_name, exists in stats['files_exist'].items():
+                status = "[green]✓ Active[/green]" if exists else "[red]✗ Missing[/red]"
+                record_count = "0"
+
+                if file_name == 'conversations':
+                    record_count = str(stats['total_conversations'])
+                elif file_name == 'tasks':
+                    record_count = str(stats['total_tasks'])
+                elif file_name == 'documents':
+                    record_count = str(stats['total_documents'])
+
+                files_table.add_row(
+                    f"{file_name}.json",
+                    status,
+                    record_count,
+                    f"./multi_agent_data/{file_name}.json"
+                )
+
+            # Complete animation
+            while current_percent < 100:
+                current_percent += 1
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            progress.update(task, completed=100, description="[bold green]✓ File status loaded![/bold green]")
+
+        # Display results
+        self.console.print(Panel(
+            files_table,
+            title="[bold cyan]📁 Data File Status[/bold cyan]",
+            border_style="cyan",
+            padding=(1, 1)
+        ))
+
+        # Additional file info
+        info_text = f"""
+        [bold]📊 Storage Summary:[/bold]
+        • Data Directory: [bold]./multi_agent_data/[/bold]
+        • Total Users: [bold]{len(stats['users'])}[/bold]
+        • Oldest Record: [bold]{stats['oldest_conversation'][:10] if stats['oldest_conversation'] != 'none' else 'None'}[/bold]
+        • Newest Record: [bold]{stats['newest_conversation'][:10] if stats['newest_conversation'] != 'none' else 'None'}[/bold]
+        """
+        self.console.print(Panel(info_text, border_style="blue", padding=(1, 2)))
+
+    def display_stats(self):
+        """Display system performance statistics"""
+        progress = self.create_progress()
+        task = progress.add_task("[bold cyan]📊 Computing statistics...[/bold cyan]", total=100)
+
+        with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+            # Animate to 30%
+            current_percent = 0
+            while current_percent < 30:
+                current_percent += 2
+                progress.update(task, completed=current_percent)
+                time.sleep(0.03)
+
+            # Get various stats
+            storage_stats = self.assistant.file_manager.get_storage_stats()
+            user_insights = self.assistant.get_user_insights(self.user_id)
+            progress.update(task, completed=60, description="[bold cyan]📊 Analyzing performance...[/bold cyan]")
+
+            current_percent = 60
+            while current_percent < 80:
+                current_percent += 1
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            # System uptime
+            uptime = datetime.now() - self.session_start
+
+            # Create stats table
+            stats_table = Table(
+                show_header=True,
+                header_style="bold cyan",
+                box=ROUNDED,
+                title="System Performance Statistics"
+            )
+            stats_table.add_column("Metric", style="bold white", width=25)
+            stats_table.add_column("Value", style="bold green", width=20)
+            stats_table.add_column("Details", style="dim", width=30)
+
+            # Add rows
+            stats_table.add_row("Session Uptime", str(uptime).split('.')[0], "Current session duration")
+            stats_table.add_row("Total Conversations", str(storage_stats['total_conversations']), "All users combined")
+            stats_table.add_row("User Conversations", str(user_insights.get('total_conversations', 0)),
+                                "Your conversations")
+            stats_table.add_row("Multi-Agent Sessions", str(user_insights.get('multi_agent_sessions', 0)),
+                                "Advanced processing used")
+            stats_table.add_row("Avg Quality Score", f"{user_insights.get('average_quality_score', 0):.2f}",
+                                "Out of 1.00")
+            stats_table.add_row("Avg Iterations", f"{user_insights.get('average_iterations', 0):.1f}",
+                                "Per multi-agent session")
+            stats_table.add_row("Context Usage", f"{user_insights.get('context_usage_rate', 0)}%",
+                                "Sessions using context")
+            stats_table.add_row("Total Documents", str(storage_stats['total_documents']), "All uploaded files")
+            stats_table.add_row("Active Tasks", str(len(self.assistant.file_manager.get_pending_tasks())),
+                                "Autonomous tasks pending")
+
+            # Complete animation
+            while current_percent < 100:
+                current_percent += 1
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            progress.update(task, completed=100, description="[bold green]✓ Statistics computed![/bold green]")
+
+        # Display results
+        self.console.print(Panel(
+            stats_table,
+            title="[bold cyan]📊 System Performance Statistics[/bold cyan]",
+            border_style="cyan",
+            padding=(1, 1)
+        ))
+
+        # Performance indicators
+        perf_text = f"""
+        [bold]🎯 Performance Indicators:[/bold]
+        • Quality Trend: [bold]{"🔥 Excellent" if user_insights.get('average_quality_score', 0) > 0.8 else "📈 Good" if user_insights.get('average_quality_score', 0) > 0.6 else "⚠️ Improving"}[/bold]
+        • Processing Efficiency: [bold]{"⚡ Fast" if user_insights.get('average_iterations', 0) < 2 else "🔄 Standard" if user_insights.get('average_iterations', 0) < 3 else "🐌 Complex"}[/bold]
+        • Memory Usage: [bold]{"💾 {:.1f}MB".format(sum([len(str(storage_stats)) for _ in range(storage_stats['total_conversations'])]) / 1024)}[/bold]
+        • Context Utilization: [bold]{"🎯 High" if user_insights.get('context_usage_rate', 0) > 70 else "📊 Medium" if user_insights.get('context_usage_rate', 0) > 30 else "📉 Low"}[/bold]
+        """
+        self.console.print(Panel(perf_text, border_style="green", padding=(1, 2)))
+
+    def display_response(self, user_message: str, ai_response: str, processing_time: float, context_used: str = ""):
+        """Display user message, context, and AI response with formatting"""
+        # Display user message
+        user_panel = Panel(
+            f"[bold blue]👤 You:[/bold blue] {user_message}",
+            border_style="blue",
+            padding=(1, 2),
+            expand=False
+        )
+        self.console.print(user_panel)
+
+        # Display context used if available
+        if context_used and context_used != "No previous conversation history available.":
+            context_preview = "\n".join(context_used.split("\n")[:5]) + "\n..." if len(
+                context_used.split("\n")) > 5 else context_used
+            self.console.print(Panel(
+                f"[bold yellow]📜 Context Used:[/bold yellow]\n{context_preview}",
+                border_style="yellow",
+                title="Relevant Context",
+                expand=False
+            ))
+
+        # Display AI response
+        conversations = self.assistant.file_manager.get_recent_conversations(self.user_id, 1)
+        quality_info = ""
+        if conversations and conversations[0].multi_agent_session:
+            session = conversations[0].multi_agent_session
+            quality_info = f"[dim]Quality: {session.quality_score:.2f} | Iterations: {session.total_iterations} | Time: {processing_time:.1f}s[/dim]"
+
+        if "```" in ai_response:
+            parts = ai_response.split("```")
+            ai_content = []
+            for i, part in enumerate(parts):
+                if i % 2 == 1:  # Code block
+                    ai_content.append(Syntax(part, "python", theme="monokai", line_numbers=True, padding=(0, 2)))
+                else:  # Regular text
+                    ai_content.append(Text(part))
+            ai_panel = Panel(
+                Columns(ai_content, padding=1),
+                title="[bold green]🤖 Assistant[/bold green]",
+                subtitle=quality_info,
+                border_style="green",
+                padding=(1, 2),
+                expand=False
+            )
+        else:
+            ai_panel = Panel(
+                ai_response,
+                title="[bold green]🤖 Assistant[/bold green]",
+                subtitle=quality_info,
+                border_style="green",
+                padding=(1, 2),
+                expand=False
+            )
+        self.console.print(ai_panel)
+        self.console.print(Rule(style="dim"))
+
+    def show_agent_progress(self, message: str):
+        """Show detailed agent processing with animated progress bars"""
+        with Live(auto_refresh=True, console=self.console, refresh_per_second=20) as live:
+            progress = self.create_progress()
+
+            # Main task
+            main_task = progress.add_task("[bold cyan]🔄 Processing your request...[/bold cyan]", total=100)
+
+            # Agent processing stages with animations
+            stages = [
+                ("context", 5, "[bold yellow]📜 Analyzing context and documents...[/bold yellow]", "yellow"),
+                ("generator", 30, "[bold green]🔧 Generator Agent creating solution...[/bold green]", "green"),
+                ("analyzer", 50, "[bold yellow]🔍 Analyzer Agent reviewing for errors...[/bold yellow]", "yellow"),
+                ("optimizer", 70, "[bold blue]⚡ Optimizer Agent refining solution...[/bold blue]", "blue"),
+                ("validator", 90, "[bold cyan]✅ Validator Agent validating accuracy...[/bold cyan]", "cyan"),
+                ("complete", 100, "[bold green]✓ All agents completed processing![/bold green]", "green")
+            ]
+
+            for stage, percent, description, color in stages:
+                # Update progress bar style
+                progress.columns[1].pulse_style = self.progress_styles.get(stage, self.progress_styles["context"])
+                progress.columns[1].complete_style = color
+
+                # Animate progress
+                current_percent = progress.tasks[main_task].completed or 0
+                while current_percent < percent:
+                    current_percent += 1
+                    progress.update(main_task, completed=current_percent)
+                    live.update(progress)
+                    time.sleep(0.03)  # Smooth animation
+
+                progress.update(main_task, completed=percent, description=description)
+                live.update(progress)
+                time.sleep(0.2)  # Pause at each stage
+
+            live.update(progress)
+
+    async def process_message_with_progress(self, message: str) -> str:
+        """Process message with detailed animated agent progress tracking"""
+        progress = self.create_progress()
+        main_task = progress.add_task("[bold cyan]🔄 Processing your request...[/bold cyan]", total=100)
+
+        with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+            # Agent processing stages
+            agent_stages = {
+                "context": (5, "[bold yellow]📜 Analyzing context...[/bold yellow]", "yellow"),
+                "generator": (30, "[bold green]🔧 Generator Agent working...[/bold green]", "green"),
+                "analyzer": (50, "[bold yellow]🔍 Analyzer Agent reviewing...[/bold yellow]", "yellow"),
+                "optimizer": (70, "[bold blue]⚡ Optimizer Agent refining...[/bold blue]", "blue"),
+                "validator": (90, "[bold cyan]✅ Validator Agent validating...[/bold cyan]", "cyan")
+            }
+
+            def progress_callback(stage: str, percent: int, description: str = ""):
+                if stage in agent_stages:
+                    stage_percent, stage_desc, color = agent_stages[stage]
+
+                    # Animate to target percentage - start from current progress
+                    current_task = progress.tasks[main_task]
+                    current_percent = int(current_task.completed) if current_task.completed else 0  # Get current progress as int
+                    while current_percent < stage_percent:
+                        current_percent += 1
+                        progress.update(main_task, completed=current_percent)
+                        time.sleep(0.02)
+
+                    # Update style and description
+                    progress.columns[1].pulse_style = self.progress_styles.get(stage, self.progress_styles["context"])
+                    progress.columns[1].complete_style = color
+                    progress.update(main_task, completed=stage_percent,
+                                    description=stage_desc if not description else description)
+
+            start_time = time.time()
+            response = await self.assistant.process_user_message(
+                self.user_id,
+                message,
+                reset_context=False,
+                progress_callback=progress_callback
+            )
+
+            # Final animation to 100%
+            current_percent = int(progress.tasks[main_task].completed)  # Get current progress as int
+            while current_percent < 100:
+                current_percent += 1
+                progress.update(main_task, completed=current_percent)
+                time.sleep(0.02)
+
+            progress.update(main_task, completed=100, description="[bold green]✓ Processing complete![/bold green]")
+            processing_time = time.time() - start_time
+
+            # Add a newline after the Live context ends to separate from next output
+        self.console.print()  # This adds the needed separation
+
+        # Get context used for display
+        context = self.assistant.get_cached_context(self.user_id)
+
+        # Display the response with context
+        self.display_response(message, response, processing_time, context)
+
+        return response
+
+    def display_insights(self):
+        """Display insights with animated progress tracking"""
+        progress = self.create_progress()
+        task = progress.add_task("[bold cyan]📊 Loading insights...[/bold cyan]", total=100)
+
+        with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+            # Animate to 30%
+            current_percent = 0
+            while current_percent < 30:
+                current_percent += 2
+                progress.update(task, completed=current_percent)
+                time.sleep(0.03)
+
+            insights = self.assistant.get_user_insights(self.user_id)
+            progress.update(task, completed=60, description="[bold cyan]📊 Analyzing conversation data...[/bold cyan]")
+            # Animate to 80%
+            current_percent = 60
+            while current_percent < 80:
+                current_percent += 1
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            if "message" in insights:
+                self.console.print(Panel(f"[yellow]{insights['message']}[/yellow]", title="[bold]📊 Insights[/bold]",
+                                         border_style="yellow"))
+            else:
+                stats_text = f"""
+                [bold]📈 Session Statistics:[/bold]
+                • Total Conversations: [bold]{insights.get('total_conversations', 0)}[/bold]
+                • Multi-Agent Sessions: [bold]{insights.get('multi_agent_sessions', 0)}[/bold]
+                • Avg. Quality Score: [bold]{insights.get('average_quality_score', 0):.2f}[/bold]
+                • Avg. Iterations: [bold]{insights.get('average_iterations', 0):.1f}[/bold]
+                • Context Usage Rate: [bold]{insights.get('context_usage_rate', 0)}%[/bold]
+                • Session Duration: [bold]{datetime.now() - self.session_start}[/bold]
+                """
+                self.console.print(
+                    Panel(stats_text, title="[bold cyan]📊 Insights[/bold cyan]", border_style="cyan", padding=(1, 2)))
+
+                if insights.get('topics'):
+                    topics_text = "\n".join(
+                        [f"• [bold]{topic}[/bold]: {count}" for topic, count in insights['topics'][:5]])
+                    self.console.print(Panel(
+                        f"[bold magenta]🏷️ Topics:[/bold magenta]\n{topics_text}",
+                        title="[bold magenta]🏷️ Discussion Topics[/bold magenta]",
+                        border_style="magenta",
+                        padding=(1, 2)
+                    ))
+
+            # Complete the progress
+            while current_percent < 100:
+                current_percent += 1
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            progress.update(task, completed=100, description="[bold green]✓ Insights loaded![/bold green]")
+
+    def display_context(self):
+        """Display context preview with animated progress"""
+        progress = self.create_progress()
+        task = progress.add_task("[bold cyan]📜 Loading context...[/bold cyan]", total=100)
+
+        with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+            # Animate to 40%
+            current_percent = 0
+            while current_percent < 40:
+                current_percent += 2
+                progress.update(task, completed=current_percent)
+                time.sleep(0.03)
+
+            context = self.assistant.file_manager.get_conversation_context(self.user_id, 5)
+            progress.update(task, completed=70, description="[bold cyan]📜 Compiling context preview...[/bold cyan]")
+            current_percent = 70  # Update current_percent to match the progress
+
+            # Animate to 90%
+            while current_percent < 90:
+                current_percent += 1
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            if not context or context == "No previous conversation history available.":
+                self.console.print(Panel(
+                    "[yellow]No conversation context available[/yellow]",
+                    title="[bold]📄 Context Preview[/bold]",
+                    border_style="yellow"
+                ))
+            else:
+                # Enhanced context visualization
+                context_lines = context.split('\n')
+                context_preview = []
+
+                for line in context_lines:
+                    if line.startswith('--- Conversation'):
+                        context_preview.append(f"\n[bold magenta]{line}[/bold magenta]")
+                    elif line.startswith('👤 USER:'):
+                        context_preview.append(f"[bold blue]{line}[/bold blue]")
+                    elif line.startswith('🤖 ASSISTANT:'):
+                        context_preview.append(f"[bold green]{line}[/bold green]")
+                    elif line.startswith('--- Document'):
+                        context_preview.append(f"\n[bold cyan]{line}[/bold cyan]")
+                    else:
+                        context_preview.append(f"[dim]{line}[/dim]")
+
+                preview_text = "".join(context_preview[:20]) + "\n..." if len(context_preview) > 20 else "".join(
+                    context_preview)
+
+                context_panel = Panel(
+                    preview_text,
+                    title=f"[bold cyan]📄 Context Preview ({len(context.split())} words)[/bold cyan]",
+                    border_style="cyan",
+                    padding=(1, 2)
+                )
+                self.console.print(context_panel)
+
+                # Show statistics
+                stats = f"""
+                [bold]Context Statistics:[/bold]
+                • Total words: {len(context.split())}
+                • Conversations: {len([line for line in context_lines if line.startswith('--- Conversation')])}
+                • Documents referenced: {len([line for line in context_lines if line.startswith('--- Document')])}
+                """
+                self.console.print(
+                    Panel(stats, title="[bold]📊 Context Stats[/bold]", border_style="blue", padding=(1, 1)))
+
+            # Complete the progress
+            while current_percent < 100:
+                current_percent += 1
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            progress.update(task, completed=100, description="[bold green]✓ Context loaded![/bold green]")
+
+    def upload_document(self):
+        """Document upload with animated progress tracking"""
+        file_path = Prompt.ask("[bold cyan]📁 Enter file path to upload[/bold cyan] (or 'back' to cancel)")
+        if file_path.strip().lower() in ['back', 'exit', 'cancel']:
+            return None
+
+        file_path = Path(file_path.strip().strip('"\''))
+        if not file_path.exists():
+            self.console.print(f"[red]File not found: {file_path}[/red]")
+            return None
+
+        file_size = file_path.stat().st_size
+        if file_size > 5 * 1024 * 1024:
+            self.console.print("[red]File too large. Maximum size is 5MB[/red]")
+            return None
+
+        progress = self.create_progress()
+        task = progress.add_task("[bold cyan]📁 Preparing upload...[/bold cyan]", total=100)
+
+        with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+            # Simulate file analysis
+            current_percent = 0
+            while current_percent < 20:
+                current_percent += 2
+                progress.update(task, completed=current_percent,
+                                description=f"[bold cyan]📁 Analyzing file ({decimal(file_size)})...[/bold cyan]")
+                time.sleep(0.05)
+
+            # Simulate processing
+            # Simulate processing
+            progress.update(task, completed=60, description="[bold cyan]💾 Uploading and indexing...[/bold cyan]")
+            current_percent = 60  # Update current_percent to match the progress
+            while current_percent < 95:
+                current_percent += 1
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            # Actual file processing
+            # Actual file processing
+            progress.update(task, completed=60, description="[bold cyan]💾 Uploading and indexing...[/bold cyan]")
+            current_percent = 60  # Update current_percent to match the progress
+            try:
+                document = self.assistant.file_manager.process_uploaded_file(str(file_path), self.user_id)
+
+                # Simulate final processing
+                while current_percent < 95:
+                    current_percent += 1
+                    progress.update(task, completed=current_percent)
+                    time.sleep(0.02)
+
+                if document:
+                    progress.update(task, completed=100,
+                                    description="[bold green]✓ Document uploaded successfully![/bold green]")
+
+                    info_table = Table(show_header=False, box=None, padding=(0, 2))
+                    info_table.add_column(style="bold cyan", width=15)
+                    info_table.add_column(style="white")
+                    info_table.add_row("Filename:", document.filename)
+                    info_table.add_row("Type:", document.file_type)
+                    info_table.add_row("Size:", decimal(document.file_size))
+                    info_table.add_row("Preview:", document.content[:100] + "..." if len(
+                        document.content) > 100 else document.content)
+                    self.console.print(
+                        Panel(info_table, title="[bold green]📄 Document Info[/bold green]", border_style="green",
+                              padding=(1, 2)))
+                else:
+                    progress.update(task, completed=100,
+                                    description="[bold red]❌ Failed to process document[/bold red]")
+                    self.console.print("[red]Failed to process document[/red]")
+
+                return document
+            except Exception as e:
+                progress.update(task, completed=100, description=f"[bold red]❌ Error: {str(e)}[/bold red]")
+                self.console.print(f"[red]Error processing document: {str(e)}[/red]")
+                return None
+
+    def display_documents(self):
+        """Display documents with animated progress"""
+        progress = self.create_progress()
+        task = progress.add_task("[bold cyan]📁 Loading documents...[/bold cyan]", total=100)
+
+        with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+            # Animate to 30%
+            current_percent = 0
+            while current_percent < 30:
+                current_percent += 2
+                progress.update(task, completed=current_percent)
+                time.sleep(0.03)
+
+            documents = self.assistant.file_manager.get_user_documents(self.user_id)
+            progress.update(task, completed=60, description="[bold cyan]📁 Compiling document list...[/bold cyan]")
+
+            # Animate to 80%
+            while current_percent < 80:
+                current_percent += 1
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            if not documents:
+                self.console.print(
+                    Panel("[yellow]No documents uploaded yet[/yellow]", title="[bold]📄 Your Documents[/bold]",
+                          border_style="yellow"))
+            else:
+                docs_table = Table(
+                    show_header=True,
+                    header_style="bold cyan",
+                    box=ROUNDED,
+                    expand=True,
+                    padding=(0, 1),
+                    title="Your Documents"
+                )
+                docs_table.add_column("ID", style="dim", width=8)
+                docs_table.add_column("Filename", style="bold cyan", width=25)
+                docs_table.add_column("Type", style="white", width=12)
+                docs_table.add_column("Size", justify="right", style="bold magenta", width=10)
+                docs_table.add_column("Uploaded", style="dim", width=12)
+                docs_table.add_column("Preview", style="green", width=30)
+
+                for doc in documents:
+                    preview = doc.content[:50] + "..." if len(doc.content) > 50 else doc.content
+                    preview = preview.replace('\n', ' ').replace('\r', ' ')
+                    docs_table.add_row(
+                        doc.id.split('_')[-1],
+                        doc.filename,
+                        doc.file_type.split('/')[-1],
+                        decimal(doc.file_size),
+                        doc.upload_time.strftime("%m-%d %H:%M"),
+                        preview
+                    )
+                self.console.print(Panel(
+                    docs_table,
+                    title=f"[bold cyan]📄 Your Documents ({len(documents)} total)[/bold cyan]",
+                    border_style="cyan",
+                    padding=(1, 1)
+                ))
+
+            # Complete the progress
+            while current_percent < 100:
+                current_percent += 1
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            progress.update(task, completed=100, description="[bold green]✓ Documents loaded![/bold green]")
+
+    async def handle_chat_mode(self):
+        """Handle chat mode with persistent context and exit option"""
+        self.console.print(Panel(
+            "[bold cyan]💬 Entering chat mode. Type [bold red]back[/bold red] or [bold red]exit[/bold red] to return to main menu.[/bold cyan]\n"
+            "[bold yellow]⚠️ Note:[/bold yellow] The system uses your conversation history and uploaded documents "
+            "to provide more accurate and context-aware responses.",
+            border_style="cyan",
+            padding=(1, 2)
+        ))
+
+        while True:
+            message = Prompt.ask("[bold cyan]👤 Your message[/bold cyan]")
+            if message.strip().lower() in ['back', 'exit']:
+                break
+
+            if message.strip():
+                # Debug: Check what context is being used
+                context = self.assistant.file_manager.get_conversation_context(self.user_id, 70)
+                self.console.print(
+                    f"[dim]DEBUG: Context loaded - {len(context.split())} words, {len(context.splitlines())} lines[/dim]")
+
+                # Show animated agent processing
+                self.show_agent_progress(message)
+                await self.process_message_with_progress(message)
+
+    async def run_interactive(self):
+        """Main interactive loop with command navigation"""
+        self.display_banner()
+        self.console.print("\n")
+        with Status("[bold cyan]🔄 Starting multi-agent assistant...[/bold cyan]", console=self.console, spinner="dots"):
+            self.assistant.start()
+            await asyncio.sleep(1)
+        self.console.print("[bold green]✓ Multi-Agent Assistant is now running![/bold green]\n")
+        self.display_help()
+
+        try:
+            while True:
+                self.console.print()
+                command = Prompt.ask("[bold blue]📝 Enter command[/bold blue] (or 'quit' to exit)").strip().lower()
+                command = self.command_aliases.get(command, command)
+
+                if command in ["quit", "exit"]:
+                    if Confirm.ask("[bold red]Are you sure you want to quit?[/bold red]"):
+                        break
+
+                elif command == "chat":
+                    await self.handle_chat_mode()
+
+                elif command == "insights":
+                    self.display_insights()
+                    Prompt.ask("[bold]Press Enter to continue...[/bold]")
+
+                elif command == "context":
+                    self.display_context()
+                    Prompt.ask("[bold]Press Enter to continue...[/bold]")
+
+                elif command == "docs":
+                    self.display_documents()
+                    Prompt.ask("[bold]Press Enter to continue...[/bold]")
+
+                elif command == "clear":
+                    self.console.clear()
+                    self.display_banner()
+                elif command == "agents":
+                    self.display_agents()
+                    Prompt.ask("[bold]Press Enter to continue...[/bold]")
+
+                elif command == "tasks":
+                    self.display_tasks()
+                    Prompt.ask("[bold]Press Enter to continue...[/bold]")
+
+                elif command == "quality":
+                    self.display_quality()
+                    Prompt.ask("[bold]Press Enter to continue...[/bold]")
+
+                elif command == "files":
+                    self.display_files()
+                    Prompt.ask("[bold]Press Enter to continue...[/bold]")
+
+                elif command == "stats":
+                    self.display_stats()
+                    Prompt.ask("[bold]Press Enter to continue...[/bold]")
+
+                elif command == "help":
+                    self.display_help()
+
+                else:
+                    self.console.print(f"[red]Unknown command: {command}[/red]")
+                    self.console.print("[dim]Type 'help' for available commands.[/dim]")
+
+        finally:
+            with Status("[bold cyan]🔄 Shutting down multi-agent assistant...[/bold cyan]", console=self.console,
+                        spinner="dots"):
+                self.assistant.stop()
+                await asyncio.sleep(1)
+            self.console.print("\n[bold green]✓ Multi-Agent Assistant stopped successfully![/bold green]")
+            self.console.print("[dim]Thank you for using the Enhanced Multi-Agent Assistant![/dim]")
+
+
+# --- Main ---
+def main():
+    console = Console()
+    api_key = os.getenv("GEMINI_API_KEY", "AIzaSyCVQuVDmdnoURtxVCZl0ay_Gt5rpBnQOK4")
+
+    if not api_key:
+        console.print("[bold red]❌ API key is required to run the assistant.[/bold red]")
+        return
+
+    with console.status("[bold cyan]🔄 Testing Gemini API connection...[/bold cyan]"):
+        try:
+            genai.configure(api_key=api_key)
+            test_model = genai.GenerativeModel('gemini-1.5-flash')
+            test_response = test_model.generate_content("Hello")
+        except Exception as e:
+            console.print(f"[bold red]❌ API connection failed: {e}[/bold red]")
+            return
+
+    console.print("[bold green]✓ API connection successful![/bold green]")
+    cli = RichMultiAgentCLI(api_key)
+    try:
+        asyncio.run(cli.run_interactive())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]⚠️ Interrupted by user[/yellow]")
+    except Exception as e:
+        import traceback
+        console.print(f"[bold red]❌ Error: {str(e)}[/bold red]")
+        console.print(f"[red]Full traceback:[/red]")
+        console.print(traceback.format_exc())
+
+
+if __name__ == "__main__":
+    main()
