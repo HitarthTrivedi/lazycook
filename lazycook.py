@@ -457,7 +457,7 @@ class TextFileManager:
                 context_parts.append(f"[Topics: {', '.join(conv.topics)}]")
 
         # Add document context if available
-        docs_context = self.get_documents_context(user_id, 7)
+        docs_context = self.get_documents_context(user_id, 10)
         if docs_context:
             context_parts.append(f"\n--- 📄 RELEVANT DOCUMENTS ---")
             context_parts.append(docs_context)
@@ -1155,8 +1155,8 @@ class RichMultiAgentCLI:
 
     def display_banner(self):
         banner_text = """
-        [bold cyan]🤖 MULTI-AGENT AUTONOMOUS ASSISTANT 🤖[/bold cyan]
-        [dim]Enhanced with Animated Progress Tracking and Context Awareness[/dim]
+        [bold cyan]                          LAZYCOOK                               [/bold cyan]
+        [dim]                        let it cook!!                      [/dim]
         """
         self.console.print(Align.center(Panel(banner_text, border_style="bold cyan", padding=(1, 2))))
 
@@ -2061,7 +2061,7 @@ class RichMultiAgentCLI:
         with Status("[bold cyan]🔄 Starting multi-agent assistant...[/bold cyan]", console=self.console, spinner="dots"):
             self.assistant.start()
             await asyncio.sleep(1)
-        self.console.print("[bold green]✓ Multi-Agent Assistant is now running![/bold green]\n")
+        self.console.print("[bold green]✓ LAZYCOOK is now running! [/bold green]\n")
         self.display_help()
 
         try:
