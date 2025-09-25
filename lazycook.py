@@ -19,8 +19,8 @@ import textwrap  # For dedent to fix indentation
 from rich.text import Text  # Already used, but ensure
 from rich.align import Align
 from rich.panel import Panel
-
-
+from rich.filesize import decimal
+from rich.prompt import Confirm
 import google.generativeai as genai
 from rich.align import Align
 from rich.box import ROUNDED
@@ -320,6 +320,8 @@ class TextFileManager:
         self.session_conversations_file = self.data_dir / "new_convo.json"
         self._ensure_files_exist()
         self._initialize_session_file()
+        self.max_documents_per_user = 100
+        self.max_storage_per_user = 100 * 1024 * 1024  # 100MB
 
     def _ensure_files_exist(self):
         for file_path in [self.conversations_file, self.tasks_file, self.documents_file]:
@@ -604,6 +606,126 @@ class TextFileManager:
             logger.error(f"Error processing file {file_path}: {e}")
             return None
 
+    @log_errors
+    def clear_all_conversations(self, user_id: str) -> bool:
+        """Clear all conversations for a specific user"""
+        try:
+            # Clear from main conversations file
+            conversations = self._read_json_file(self.conversations_file)
+            original_count = len([c for c in conversations if c.get('user_id') == user_id])
+            conversations = [c for c in conversations if c.get('user_id') != user_id]
+            self._write_json_file(self.conversations_file, conversations)
+
+            # Clear from session conversations file
+            session_conversations = self._read_json_file(self.session_conversations_file)
+            session_conversations = [c for c in session_conversations if c.get('user_id') != user_id]
+            self._write_json_file(self.session_conversations_file, session_conversations)
+
+            # Clear cached context
+            self._cached_context.pop(user_id, None)
+
+            logger.info(f"Cleared {original_count} conversations for user {user_id}")
+            return original_count > 0
+        except Exception as e:
+            logger.error(f"Failed to clear conversations: {e}")
+            return False
+
+    @log_errors
+    def clear_all_documents(self, user_id: str) -> int:
+        """Clear all documents for a specific user and return count deleted"""
+        try:
+            documents = self._read_json_file(self.documents_file)
+            user_docs_count = len([d for d in documents if d.get('user_id') == user_id])
+            documents = [d for d in documents if d.get('user_id') != user_id]
+            self._write_json_file(self.documents_file, documents)
+            logger.info(f"Cleared {user_docs_count} documents for user {user_id}")
+            return user_docs_count
+        except Exception as e:
+            logger.error(f"Failed to clear documents: {e}")
+            return 0
+
+    @log_errors
+    def delete_document_by_filename(self, filename: str, user_id: str) -> bool:
+        """Delete a document by filename for specific user"""
+        try:
+            documents = self._read_json_file(self.documents_file)
+            original_count = len(documents)
+            documents = [d for d in documents if not (d.get('filename') == filename and d.get('user_id') == user_id)]
+            if len(documents) < original_count:
+                self._write_json_file(self.documents_file, documents)
+                logger.info(f"Deleted document: {filename} for user {user_id}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Failed to delete document {filename}: {e}")
+            return False
+
+    @log_errors
+    def get_documents_capacity_info(self, user_id: str) -> Dict[str, Any]:
+        """Get document capacity information for a user"""
+        try:
+            documents = self.get_user_documents(user_id, 1000)  # Get all docs
+            total_size = sum(doc.file_size for doc in documents)
+            total_count = len(documents)
+
+            # Define limits (configurable)
+            max_documents = getattr(self, 'max_documents_per_user', 50)
+            max_total_size = getattr(self, 'max_storage_per_user', 50 * 1024 * 1024)  # 50MB default
+
+            return {
+                'total_documents': total_count,
+                'total_size_bytes': total_size,
+                'total_size_mb': round(total_size / (1024 * 1024), 2),
+                'max_documents': max_documents,
+                'max_size_mb': round(max_total_size / (1024 * 1024), 2),
+                'documents_remaining': max(0, max_documents - total_count),
+                'size_remaining_mb': max(0, round((max_total_size - total_size) / (1024 * 1024), 2)),
+                'at_document_limit': total_count >= max_documents,
+                'at_size_limit': total_size >= max_total_size,
+                'usage_percentage': min(100, round((total_size / max_total_size) * 100, 1))
+            }
+        except Exception as e:
+            logger.error(f"Failed to get capacity info: {e}")
+            return {
+                'total_documents': 0,
+                'total_size_bytes': 0,
+                'total_size_mb': 0,
+                'max_documents': 50,
+                'max_size_mb': 50,
+                'documents_remaining': 50,
+                'size_remaining_mb': 50,
+                'at_document_limit': False,
+                'at_size_limit': False,
+                'usage_percentage': 0
+            }
+
+    @log_errors
+    def clear_old_conversations(self, user_id: str, keep_recent: int = 20) -> int:
+        """Clear old conversations, keeping only the most recent ones"""
+        try:
+            conversations = self._read_json_file(self.conversations_file)
+            user_conversations = [c for c in conversations if c.get('user_id') == user_id]
+            other_conversations = [c for c in conversations if c.get('user_id') != user_id]
+
+            # Sort by timestamp and keep only recent ones
+            user_conversations.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+            kept_conversations = user_conversations[:keep_recent]
+            deleted_count = len(user_conversations) - len(kept_conversations)
+
+            # Combine with other users' conversations
+            all_conversations = other_conversations + kept_conversations
+            self._write_json_file(self.conversations_file, all_conversations)
+
+            # Also clean session conversations
+            session_conversations = self._read_json_file(self.session_conversations_file)
+            session_conversations = [c for c in session_conversations if c.get('user_id') != user_id]
+            self._write_json_file(self.session_conversations_file, session_conversations)
+
+            logger.info(f"Cleared {deleted_count} old conversations for user {user_id}, kept {len(kept_conversations)}")
+            return deleted_count
+        except Exception as e:
+            logger.error(f"Failed to clear old conversations: {e}")
+            return 0
 
 # --- AI Agent ---
 class AIAgent:
@@ -976,6 +1098,7 @@ class AutonomousMultiAgentAssistant:
         return self.file_manager.get_conversation_context(user_id, 70)
 
     def clear_cached_context(self, user_id: str):
+        """Clear cached context for a user"""
         self._cached_context.pop(user_id, None)
 
     @log_errors
@@ -1135,11 +1258,12 @@ class AutonomousMultiAgentAssistant:
 # --- Rich CLI ---
 class RichMultiAgentCLI:
     def __init__(self, api_key: str):
-        self.console = Console()
+        self.console = Console()  # This line was missing!
         self.assistant = AutonomousMultiAgentAssistant(api_key)
-        self.user_id = "default_user"
-        self.conversation_count = 0
+        self.user_id = "user_001"
         self.session_start = datetime.now()
+
+        # Command aliases
         self.command_aliases = {
             'q': 'quit', 'exit': 'quit',
             'c': 'chat',
@@ -1147,8 +1271,13 @@ class RichMultiAgentCLI:
             't': 'tasks',
             'd': 'docs',
             'h': 'help',
-            'b': 'back'
+            'b': 'back',
+            'm': 'maintenance',  # New alias
+            'clean': 'maintenance',  # New alias
+            'del': 'maintenance',  # New alias
+            'clear': 'cls'  # Modified to avoid conflict
         }
+
         # Custom progress bar styles
         self.progress_styles = {
             "context": Style(color="yellow", blink=False, bold=True),
@@ -1210,18 +1339,25 @@ class RichMultiAgentCLI:
     def display_help(self):
         help_text = """
         [bold magenta]📋 Available Commands:[/bold magenta]
-        • [bold green]chat[/bold green]       Start a conversation (type [bold red]back[/bold red] to exit)
-        • [bold green]insights[/bold green]   View user interaction statistics
-        • [bold green]docs[/bold green]       Manage uploaded documents
-        • [bold green]tasks[/bold green]      Show autonomous tasks and status
-        • [bold green]quality[/bold green]    Display recent quality scores
-        • [bold green]agents[/bold green]     Show multi-agent architecture
-        • [bold green]context[/bold green]    Preview conversation context
-        • [bold green]files[/bold green]      Check data file status
-        • [bold green]stats[/bold green]      System performance statistics
-        • [bold green]clear[/bold green]      Clear the console screen
-        • [bold green]help[/bold green]       Show this help menu
-        • [bold red]quit[/bold red]          Exit the application
+        • [bold green]chat[/bold green]         Start a conversation (type [bold red]back[/bold red] to exit)
+        • [bold green]insights[/bold green]     View user interaction statistics
+        • [bold green]docs[/bold green]         Manage uploaded documents (view/upload)
+        • [bold green]maintenance[/bold green]  🔧 Cleanup & management (NEW!)
+        • [bold green]tasks[/bold green]        Show autonomous tasks and status
+        • [bold green]quality[/bold green]      Display recent quality scores
+        • [bold green]agents[/bold green]       Show multi-agent architecture
+        • [bold green]context[/bold green]      Preview conversation context
+        • [bold green]files[/bold green]        Check data file status
+        • [bold green]stats[/bold green]        System performance statistics
+        • [bold green]cls[/bold green]          Clear the console screen
+        • [bold green]help[/bold green]         Show this help menu
+        • [bold red]quit[/bold red]            Exit the application
+
+        [bold yellow]🔧 New Maintenance Features:[/bold yellow]
+        • Delete specific documents or clear all documents
+        • Clear conversations with various options (all/recent)
+        • Document capacity management (50 docs / 50MB limit)
+        • Full system cleanup options
 
         [dim]Type 'back' to return to main menu from any command.[/dim]
         [bold yellow]⚠️ Note:[/bold yellow] The system uses conversation history and uploaded documents
@@ -1992,7 +2128,30 @@ class RichMultiAgentCLI:
             progress.update(task, completed=100, description="[bold green]✓ Context loaded![/bold green]")
 
     def upload_document(self):
-        """Document upload with animated progress tracking"""
+        """Document upload with capacity checking and animated progress tracking"""
+        # Check capacity first
+        capacity_info = self.assistant.file_manager.get_documents_capacity_info(self.user_id)
+
+        if capacity_info['at_document_limit']:
+            self.console.print(Panel(
+                f"[red]❌ Document limit reached![/red]\n"
+                f"You have {capacity_info['total_documents']}/{capacity_info['max_documents']} documents.\n"
+                f"Please delete some documents first.",
+                title="[bold red]Upload Failed[/bold red]",
+                border_style="red"
+            ))
+            return None
+
+        if capacity_info['at_size_limit']:
+            self.console.print(Panel(
+                f"[red]❌ Storage limit reached![/red]\n"
+                f"You have used {capacity_info['total_size_mb']:.1f}MB/{capacity_info['max_size_mb']}MB.\n"
+                f"Please delete some documents first.",
+                title="[bold red]Upload Failed[/bold red]",
+                border_style="red"
+            ))
+            return None
+
         file_path = Prompt.ask("[bold cyan]📁 Enter file path to upload[/bold cyan] (or 'back' to cancel)")
         if file_path.strip().lower() in ['back', 'exit', 'cancel']:
             return None
@@ -2003,8 +2162,20 @@ class RichMultiAgentCLI:
             return None
 
         file_size = file_path.stat().st_size
+
+        # Check if this file would exceed limits
+        if capacity_info['total_documents'] + 1 > capacity_info['max_documents']:
+            self.console.print("[red]This upload would exceed the document limit[/red]")
+            return None
+
+        if capacity_info['total_size_bytes'] + file_size > self.assistant.file_manager.max_storage_per_user:
+            needed_mb = round((capacity_info['total_size_bytes'] + file_size) / (1024 * 1024), 2)
+            self.console.print(
+                f"[red]This upload would exceed storage limit ({needed_mb}MB > {capacity_info['max_size_mb']}MB)[/red]")
+            return None
+
         if file_size > 5 * 1024 * 1024:
-            self.console.print("[red]File too large. Maximum size is 5MB[/red]")
+            self.console.print("[red]File too large. Maximum size is 5MB per file[/red]")
             return None
 
         progress = self.create_progress()
@@ -2020,18 +2191,8 @@ class RichMultiAgentCLI:
                 time.sleep(0.05)
 
             # Simulate processing
-            # Simulate processing
             progress.update(task, completed=60, description="[bold cyan]💾 Uploading and indexing...[/bold cyan]")
-            current_percent = 60  # Update current_percent to match the progress
-            while current_percent < 95:
-                current_percent += 1
-                progress.update(task, completed=current_percent)
-                time.sleep(0.02)
-
-            # Actual file processing
-            # Actual file processing
-            progress.update(task, completed=60, description="[bold cyan]💾 Uploading and indexing...[/bold cyan]")
-            current_percent = 60  # Update current_percent to match the progress
+            current_percent = 60
             try:
                 document = self.assistant.file_manager.process_uploaded_file(str(file_path), self.user_id)
 
@@ -2043,7 +2204,10 @@ class RichMultiAgentCLI:
 
                 if document:
                     progress.update(task, completed=100,
-                                    description="[bold green]✓ Document uploaded successfully![/bold green]")
+                                    description="[bold green]✅ Document uploaded successfully![/bold green]")
+
+                    # Show updated capacity info
+                    new_capacity = self.assistant.file_manager.get_documents_capacity_info(self.user_id)
 
                     info_table = Table(show_header=False, box=None, padding=(0, 2))
                     info_table.add_column(style="bold cyan", width=15)
@@ -2051,8 +2215,13 @@ class RichMultiAgentCLI:
                     info_table.add_row("Filename:", document.filename)
                     info_table.add_row("Type:", document.file_type)
                     info_table.add_row("Size:", decimal(document.file_size))
+                    info_table.add_row("Documents:",
+                                       f"{new_capacity['total_documents']}/{new_capacity['max_documents']}")
+                    info_table.add_row("Storage:",
+                                       f"{new_capacity['total_size_mb']:.1f}MB/{new_capacity['max_size_mb']}MB")
                     info_table.add_row("Preview:", document.content[:100] + "..." if len(
                         document.content) > 100 else document.content)
+
                     self.console.print(
                         Panel(info_table, title="[bold green]📄 Document Info[/bold green]", border_style="green",
                               padding=(1, 2)))
@@ -2134,6 +2303,323 @@ class RichMultiAgentCLI:
                 time.sleep(0.02)
 
             progress.update(task, completed=100, description="[bold green]✓ Documents loaded![/bold green]")
+
+        # Add these methods to the RichMultiAgentCLI class (around line 1200, after existing display methods)
+
+    def delete_specific_document(self):
+        """Delete a specific document with interactive selection"""
+        progress = self.create_progress()
+        task = progress.add_task("[bold cyan]📄 Loading documents...[/bold cyan]", total=100)
+
+        with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+            # Animate to 40%
+            current_percent = 0
+            while current_percent < 40:
+                current_percent += 2
+                progress.update(task, completed=current_percent)
+                time.sleep(0.03)
+
+            documents = self.assistant.file_manager.get_user_documents(self.user_id)
+
+            # Complete animation
+            while current_percent < 100:
+                current_percent += 2
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            progress.update(task, completed=100, description="[bold green]✅ Documents loaded![/bold green]")
+
+        if not documents:
+            self.console.print(Panel(
+                "[yellow]No documents to delete[/yellow]",
+                title="[bold]📄 Delete Document[/bold]",
+                border_style="yellow"
+            ))
+            return
+
+        # Display documents for selection
+        docs_table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            box=ROUNDED,
+            title="Select Document to Delete"
+        )
+        docs_table.add_column("#", style="bold magenta", width=3)
+        docs_table.add_column("Filename", style="bold cyan", width=25)
+        docs_table.add_column("Type", style="white", width=12)
+        docs_table.add_column("Size", justify="right", style="bold magenta", width=10)
+        docs_table.add_column("Uploaded", style="dim", width=12)
+
+        for i, doc in enumerate(documents, 1):
+            docs_table.add_row(
+                str(i),
+                doc.filename,
+                doc.file_type.split('/')[-1],
+                decimal(doc.file_size),
+                doc.upload_time.strftime("%m-%d %H:%M")
+            )
+
+        self.console.print(Panel(
+            docs_table,
+            title="[bold red]🗑️ Delete Document[/bold red]",
+            border_style="red",
+            padding=(1, 1)
+        ))
+
+        try:
+            choice = Prompt.ask(
+                f"[bold cyan]Enter document number (1-{len(documents)}) or 'back' to cancel[/bold cyan]"
+            ).strip()
+
+            if choice.lower() in ['back', 'cancel', 'exit']:
+                return
+
+            doc_index = int(choice) - 1
+            if 0 <= doc_index < len(documents):
+                selected_doc = documents[doc_index]
+
+                if Confirm.ask(f"[bold red]Are you sure you want to delete '{selected_doc.filename}'?[/bold red]"):
+                    if self.assistant.file_manager.delete_document(selected_doc.id, self.user_id):
+                        self.console.print(
+                            f"[bold green]✅ Document '{selected_doc.filename}' deleted successfully![/bold green]")
+                    else:
+                        self.console.print(
+                            f"[bold red]❌ Failed to delete document '{selected_doc.filename}'[/bold red]")
+            else:
+                self.console.print("[red]Invalid selection[/red]")
+
+        except ValueError:
+            self.console.print("[red]Invalid input. Please enter a number.[/red]")
+        except Exception as e:
+            self.console.print(f"[red]Error: {str(e)}[/red]")
+
+    def clear_conversations_menu(self):
+        """Interactive menu for clearing conversations"""
+        options_text = """
+        [bold magenta]🗑️ Clear Conversations Options:[/bold magenta]
+
+        • [bold green]1[/bold green] - Clear ALL conversations (complete reset)
+        • [bold yellow]2[/bold yellow] - Clear old conversations (keep recent 20)
+        • [bold blue]3[/bold blue] - Clear old conversations (keep recent 10)
+        • [bold red]4[/bold red] - Clear old conversations (keep recent 5)
+        • [bold dim]back[/bold dim] - Return to main menu
+
+        [bold yellow]⚠️ Warning:[/bold yellow] This action cannot be undone!
+        """
+
+        self.console.print(Panel(options_text, border_style="red", padding=(1, 2)))
+
+        choice = Prompt.ask("[bold cyan]Select option[/bold cyan]").strip().lower()
+
+        if choice in ['back', 'cancel', 'exit']:
+            return
+
+        # Show current conversation count
+        conversations = self.assistant.file_manager.get_recent_conversations(self.user_id, 1000)
+        current_count = len(conversations)
+
+        self.console.print(f"[bold]Current conversations: {current_count}[/bold]")
+
+        if choice == '1':
+            # Clear all conversations
+            if Confirm.ask(
+                    f"[bold red]Are you sure you want to delete ALL {current_count} conversations?[/bold red]"):
+                progress = self.create_progress()
+                task = progress.add_task("[bold red]🗑️ Clearing all conversations...[/bold red]", total=100)
+
+                with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+                    for i in range(100):
+                        progress.update(task, completed=i + 1)
+                        time.sleep(0.02)
+
+                    success = self.assistant.file_manager.clear_all_conversations(self.user_id)
+
+                if success:
+                    self.console.print("[bold green]✅ All conversations cleared successfully![/bold green]")
+                    # Clear cached context
+                    self.assistant.clear_cached_context(self.user_id)
+                else:
+                    self.console.print("[bold red]❌ Failed to clear conversations[/bold red]")
+
+        elif choice in ['2', '3', '4']:
+            # Clear old conversations with different keep amounts
+            keep_amounts = {'2': 20, '3': 10, '4': 5}
+            keep_recent = keep_amounts[choice]
+
+            if current_count <= keep_recent:
+                self.console.print(
+                    f"[yellow]You only have {current_count} conversations. No need to clear old ones.[/yellow]")
+                return
+
+            to_delete = current_count - keep_recent
+            if Confirm.ask(
+                    f"[bold yellow]Delete {to_delete} old conversations and keep the {keep_recent} most recent?[/bold yellow]"):
+                progress = self.create_progress()
+                task = progress.add_task(f"[bold yellow]🗑️ Clearing {to_delete} old conversations...[/bold yellow]",
+                                         total=100)
+
+                with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+                    for i in range(100):
+                        progress.update(task, completed=i + 1)
+                        time.sleep(0.02)
+
+                    deleted_count = self.assistant.file_manager.clear_old_conversations(self.user_id, keep_recent)
+
+                self.console.print(
+                    f"[bold green]✅ Cleared {deleted_count} old conversations, kept {keep_recent} recent ones![/bold green]")
+                # Clear cached context to refresh
+                self.assistant.clear_cached_context(self.user_id)
+        else:
+            self.console.print("[red]Invalid option selected[/red]")
+
+    def manage_documents_menu(self):
+        """Enhanced document management with capacity info and delete options"""
+        while True:
+            # Get capacity info
+            capacity_info = self.assistant.file_manager.get_documents_capacity_info(self.user_id)
+
+            # Create capacity display
+            usage_bar = "█" * int(capacity_info['usage_percentage'] / 5) + "░" * (
+                    20 - int(capacity_info['usage_percentage'] / 5))
+            capacity_color = "red" if capacity_info['usage_percentage'] > 80 else "yellow" if capacity_info[
+                                                                                                  'usage_percentage'] > 60 else "green"
+
+            menu_text = f"""
+            [bold magenta]📄 Document Management:[/bold magenta]
+
+            [bold]Storage Usage:[/bold]
+            [{capacity_color}]{usage_bar}[/{capacity_color}] {capacity_info['usage_percentage']}%
+            • Documents: {capacity_info['total_documents']}/{capacity_info['max_documents']} ({capacity_info['documents_remaining']} remaining)
+            • Storage: {capacity_info['total_size_mb']}MB/{capacity_info['max_size_mb']}MB ({capacity_info['size_remaining_mb']}MB remaining)
+
+            [bold]Options:[/bold]
+            • [bold green]1[/bold green] - View all documents
+            • [bold blue]2[/bold blue] - Upload new document
+            • [bold yellow]3[/bold yellow] - Delete specific document
+            • [bold red]4[/bold red] - Clear all documents
+            • [bold dim]back[/bold dim] - Return to main menu
+            """
+
+            # Add warnings if at limits
+            if capacity_info['at_document_limit']:
+                menu_text += "\n[bold red]⚠️ Document limit reached! Delete some documents to upload new ones.[/bold red]"
+            if capacity_info['at_size_limit']:
+                menu_text += "\n[bold red]⚠️ Storage limit reached! Delete some documents to free space.[/bold red]"
+
+            self.console.print(Panel(menu_text, border_style="cyan", padding=(1, 2)))
+
+            choice = Prompt.ask("[bold cyan]Select option[/bold cyan]").strip().lower()
+
+            if choice in ['back', 'cancel', 'exit']:
+                break
+            elif choice == '1':
+                self.display_documents()
+                Prompt.ask("[bold]Press Enter to continue...[/bold]")
+            elif choice == '2':
+                if capacity_info['at_document_limit']:
+                    self.console.print("[red]❌ Document limit reached! Delete some documents first.[/red]")
+                elif capacity_info['at_size_limit']:
+                    self.console.print("[red]❌ Storage limit reached! Delete some documents first.[/red]")
+                else:
+                    self.upload_document()
+                Prompt.ask("[bold]Press Enter to continue...[/bold]")
+            elif choice == '3':
+                self.delete_specific_document()
+                Prompt.ask("[bold]Press Enter to continue...[/bold]")
+            elif choice == '4':
+                if Confirm.ask(
+                        f"[bold red]Are you sure you want to delete ALL {capacity_info['total_documents']} documents?[/bold red]"):
+                    progress = self.create_progress()
+                    task = progress.add_task("[bold red]🗑️ Clearing all documents...[/bold red]", total=100)
+
+                    with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+                        for i in range(100):
+                            progress.update(task, completed=i + 1)
+                            time.sleep(0.02)
+
+                        deleted_count = self.assistant.file_manager.clear_all_documents(self.user_id)
+
+                    self.console.print(
+                        f"[bold green]✅ Cleared {deleted_count} documents successfully![/bold green]")
+                Prompt.ask("[bold]Press Enter to continue...[/bold]")
+            else:
+                self.console.print("[red]Invalid option selected[/red]")
+
+    def display_maintenance_menu(self):
+        """Display maintenance and cleanup options"""
+        maintenance_text = """
+        [bold magenta]🔧 Maintenance & Cleanup:[/bold magenta]
+
+        • [bold green]1[/bold green] - Clear conversations (with options)
+        • [bold blue]2[/bold blue] - Manage documents (view/delete/capacity)
+        • [bold yellow]3[/bold yellow] - View storage statistics
+        • [bold red]4[/bold red] - Full system cleanup (conversations + documents)
+        • [bold dim]back[/bold dim] - Return to main menu
+
+        [bold yellow]⚠️ Warning:[/bold yellow] Cleanup operations cannot be undone!
+        """
+
+        self.console.print(Panel(maintenance_text, border_style="yellow", padding=(1, 2)))
+
+        choice = Prompt.ask("[bold cyan]Select maintenance option[/bold cyan]").strip().lower()
+
+        if choice in ['back', 'cancel', 'exit']:
+            return
+        elif choice == '1':
+            self.clear_conversations_menu()
+        elif choice == '2':
+            self.manage_documents_menu()
+        elif choice == '3':
+            self.display_stats()
+        elif choice == '4':
+            # Full cleanup
+            conversations = self.assistant.file_manager.get_recent_conversations(self.user_id, 1000)
+            documents = self.assistant.file_manager.get_user_documents(self.user_id, 1000)
+
+            warning_text = f"""
+            [bold red]⚠️ FULL SYSTEM CLEANUP WARNING ⚠️[/bold red]
+
+            This will delete:
+            • All {len(conversations)} conversations
+            • All {len(documents)} documents
+            • All cached context data
+
+            This action is [bold red]IRREVERSIBLE[/bold red]!
+            """
+
+            self.console.print(Panel(warning_text, border_style="red", padding=(1, 2)))
+
+            if Confirm.ask("[bold red]Are you absolutely sure you want to perform a full cleanup?[/bold red]"):
+                if Confirm.ask("[bold red]This is your final warning. Continue with full cleanup?[/bold red]"):
+                    progress = self.create_progress()
+                    task = progress.add_task("[bold red]🗑️ Performing full system cleanup...[/bold red]", total=100)
+
+                    with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+                        # Clear conversations
+                        progress.update(task, completed=25,
+                                        description="[bold red]🗑️ Clearing conversations...[/bold red]")
+                        conv_success = self.assistant.file_manager.clear_all_conversations(self.user_id)
+
+                        # Clear documents
+                        progress.update(task, completed=50,
+                                        description="[bold red]🗑️ Clearing documents...[/bold red]")
+                        doc_count = self.assistant.file_manager.clear_all_documents(self.user_id)
+
+                        # Clear cache
+                        progress.update(task, completed=75, description="[bold red]🗑️ Clearing cache...[/bold red]")
+                        self.assistant.clear_cached_context(self.user_id)
+
+                        # Complete
+                        progress.update(task, completed=100,
+                                        description="[bold green]✅ Full cleanup complete![/bold green]")
+                        time.sleep(1)
+
+                    self.console.print(f"[bold green]✅ Full cleanup completed successfully![/bold green]")
+                    self.console.print(f"• Conversations cleared: {len(conversations)}")
+                    self.console.print(f"• Documents cleared: {doc_count}")
+                    self.console.print("• Cache cleared")
+        else:
+            self.console.print("[red]Invalid option selected[/red]")
 
     async def handle_chat_mode(self):
         """Handle chat mode with persistent context and exit option"""
@@ -2220,6 +2706,14 @@ class RichMultiAgentCLI:
 
                 elif command == "help":
                     self.display_help()
+
+                elif command == "maintenance":
+                    self.display_maintenance_menu()
+                    Prompt.ask("[bold]Press Enter to continue...[/bold]")
+
+                elif command == "cls":
+                    self.console.clear()
+                    self.display_banner()
 
                 else:
                     self.console.print(f"[red]Unknown command: {command}[/red]")
