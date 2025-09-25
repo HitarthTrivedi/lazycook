@@ -13,6 +13,13 @@ from functools import wraps
 from pathlib import Path
 from threading import Lock
 from typing import Dict, Any, List, Optional, Callable
+from rich.markdown import Markdown  # For rendering Markdown in AI response
+from rich import box  # For advanced box styles (e.g., SHADOW)
+import textwrap  # For dedent to fix indentation
+from rich.text import Text  # Already used, but ensure
+from rich.align import Align
+from rich.panel import Panel
+
 
 import google.generativeai as genai
 from rich.align import Align
@@ -1154,11 +1161,51 @@ class RichMultiAgentCLI:
         }
 
     def display_banner(self):
-        banner_text = """
-        [bold cyan]                          LAZYCOOK                               [/bold cyan]
-        [dim]                        let it cook!!                      [/dim]
+        """Display the exact ASCII art banner design for LAZYCOOK."""
+        # Exact raw ASCII art from the design (multi-line string)
+        raw_banner = """
+    ╔═══════════════════════════════════════════════════════════════════════════╗
+    ║                                                                           ║
+    ║  ██╗     ██╗  ███████╗██╗   ██╗ ██████╗ ██████╗  ██████╗ ██╗  ██╗         ║
+    ║  ██║    ████║    ███╔╝╚██╗ ██╔╝██╔════╝██╔═══██╗██╔═══██╗██║ ██╔╝         ║
+    ║  ██║   ██╔██║   ███╔╝  ╚████╔╝ ██║     ██║   ██║██║   ██║█████╔╝          ║
+    ║  ██║  ██╔╝██║  ███╔╝    ╚██╔╝  ██║     ██║   ██║██║   ██║██╔═██╗          ║
+    ║  ██████╔╝ ██║ ███████╗   ██║   ╚██████╗╚██████╔╝╚██████╔╝██║  ██╗         ║
+    ║  ╚═════╝  ╚═╝ ╚══════╝   ╚═╝    ╚═════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝         ║
+    ║                                                                           ║
+    ║                     [dim]🔥 === Let it cook! === 🔥[/dim]                  ║
+    ║                                                                           ║
+    ╚═══════════════════════════════════════════════════════════════════════════╝
         """
-        self.console.print(Align.center(Panel(banner_text, border_style="bold cyan", padding=(1, 2))))
+
+        # Dedent to remove Python indentation and clean (ensure exact 79-char width)
+        banner_lines = textwrap.dedent(raw_banner).strip().split("\n")
+        # Verify/enforce alignment: Pad any short lines to 79 chars (your design width)
+        design_width = 79
+        banner_lines = [line.ljust(design_width) if len(line) < design_width else line for line in banner_lines]
+
+        # Build styled Text object: Bold cyan for art lines, preserve dim markup for subtitle
+        banner_text = Text()
+        for i, line in enumerate(banner_lines):
+            if "[dim]" in line:  # Subtitle line: Keep Rich markup as-is (dim with emojis)
+                banner_text.append(line + "\n", style="")  # No extra style; markup handles dim
+            else:  # Art/border lines: Bold cyan
+                # Replace any existing markup if needed, but apply bold cyan
+                clean_line = line.replace("[dim]", "").replace("[/dim]", "")  # Clean if any
+                banner_text.append(clean_line + "\n", style="bold cyan")
+
+        # Create a simple panel (no border, as art has its own; just for containment)
+        panel = Panel(
+            banner_text,
+            title="",  # No title to match exact design
+            border_style="",  # No border (use art's box)
+            padding=(0, 0),  # Zero padding to preserve exact spacing/indentation
+            box=box.MINIMAL,  # Invisible/minimal box (no extra lines)
+            width=design_width  # Fixed width to match design exactly
+        )
+
+        # Center the entire panel (horizontal alignment; vertical middle for balance)
+        self.console.print(Align.center(panel, vertical="middle"))
 
     def display_help(self):
         help_text = """
@@ -1598,61 +1645,120 @@ class RichMultiAgentCLI:
         self.console.print(Panel(perf_text, border_style="green", padding=(1, 2)))
 
     def display_response(self, user_message: str, ai_response: str, processing_time: float, context_used: str = ""):
-        """Display user message, context, and AI response with formatting"""
-        # Display user message
+        """Display user message, context, topics, and AI response with enhanced Markdown rendering and alignment."""
+        # Fetch latest conversation for topics and quality info
+        conversations = self.assistant.file_manager.get_recent_conversations(self.user_id, 1)
+        quality_info = ""
+        topics = []
+        if conversations and conversations[0].multi_agent_session:
+            session = conversations[0].multi_agent_session
+            quality_info = f"Quality: {session.quality_score:.2f} | Iterations: {session.total_iterations} | Time: {processing_time:.1f}s"
+            topics = conversations[0].topics  # Extract topics for display
+
+        # 1. User Message Panel (simple blue style)
         user_panel = Panel(
-            f"[bold blue]👤 You:[/bold blue] {user_message}",
-            border_style="blue",
+            Text(f"👤 You", style="bold blue") + Text(f": {user_message}", style="italic blue"),
+            title="Your Message",
+            border_style="blue",  # Simple solid color
             padding=(1, 2),
-            expand=False
+            box=box.SHADOW if hasattr(box, 'SHADOW') else box.ROUNDED,  # Shadow for depth (fallback to rounded)
+            expand=True  # Fill width, wrap text to prevent horizontal scrolling
         )
         self.console.print(user_panel)
 
-        # Display context used if available
-        if context_used and context_used != "No previous conversation history available.":
-            context_preview = "\n".join(context_used.split("\n")[:5]) + "\n..." if len(
-                context_used.split("\n")) > 5 else context_used
-            self.console.print(Panel(
-                f"[bold yellow]📜 Context Used:[/bold yellow]\n{context_preview}",
-                border_style="yellow",
-                title="Relevant Context",
-                expand=False
-            ))
+        # 2. Context Preview (only if meaningful, with bullets for multi-line)
+        if context_used and len(
+                context_used.strip()) > 50 and context_used != "No previous conversation history available.":
+            # Clean and bullet-ify context preview (first 3-5 lines)
+            context_lines = [line.strip() for line in context_used.split("\n") if line.strip()][:5]
+            if len(context_lines) > 1:
+                context_preview = "\n".join([f"• {line}" for line in context_lines]) + "\n..."
+            else:
+                context_preview = context_lines[0] + "..."
 
-        # Display AI response
-        conversations = self.assistant.file_manager.get_recent_conversations(self.user_id, 1)
-        quality_info = ""
-        if conversations and conversations[0].multi_agent_session:
-            session = conversations[0].multi_agent_session
-            quality_info = f"[dim]Quality: {session.quality_score:.2f} | Iterations: {session.total_iterations} | Time: {processing_time:.1f}s[/dim]"
-
-        if "```" in ai_response:
-            parts = ai_response.split("```")
-            ai_content = []
-            for i, part in enumerate(parts):
-                if i % 2 == 1:  # Code block
-                    ai_content.append(Syntax(part, "python", theme="monokai", line_numbers=True, padding=(0, 2)))
-                else:  # Regular text
-                    ai_content.append(Text(part))
-            ai_panel = Panel(
-                Columns(ai_content, padding=1),
-                title="[bold green]🤖 Assistant[/bold green]",
-                subtitle=quality_info,
-                border_style="green",
+            context_panel = Panel(
+                Text(context_preview, style="dim yellow"),
+                title="📜 Context Preview",
+                border_style="yellow",  # Simple solid color
                 padding=(1, 2),
-                expand=False
+                expand=True
             )
+            self.console.print(context_panel)
+
+        # 3. Main Content: AI Response + Topics in Columns (no horizontal scroll)
+        main_content = []
+
+        # AI Response: Render as Markdown for beautiful handling of #, *, \n
+        try:
+            # Use Rich Markdown to render headers, bullets, etc. (no raw #, *, \n)
+            markdown_content = Markdown(ai_response)
+            # Clean any raw artifacts if Markdown parsing fails partially
+            ai_response_clean = ai_response.replace("*\n", "• ").replace("# ", "🔹 ")  # Fallback cleaning
+            if not markdown_content:  # If Markdown fails, use cleaned text
+                markdown_content = Text(ai_response_clean, style="white")
+
+            response_panel = Panel(
+                markdown_content,
+                title=Text("🤖 Assistant Response", style="bold green"),
+                border_style="green",  # Simple solid color
+                padding=(1, 2),
+                box=box.SHADOW if hasattr(box, 'SHADOW') else box.ROUNDED,
+                expand=True
+            )
+            main_content.append(response_panel)
+        except Exception as e:
+            # Fallback: Plain text with basic cleaning (remove raw #, convert * to bullets, handle \n)
+            import logging  # Ensure logger is available (or use print for debug)
+            logging.getLogger(__name__).warning(f"Markdown rendering failed: {e}")  # Log for debugging
+            cleaned_response = ai_response.replace("\n\n", "\n").replace("# ",
+                                                                         "🔹 ")  # Headers to icons, clean extra newlines
+            cleaned_response = cleaned_response.replace("* ", "• ").replace("- ", "• ")  # Bullets without raw *
+            cleaned_response = "\n".join(
+                [line.strip() for line in cleaned_response.split("\n") if line.strip()])  # Remove empty lines
+            response_panel = Panel(
+                Text(cleaned_response, style="white", justify="left"),  # Justify for left-alignment and wrapping
+                title=Text("🤖 Assistant Response", style="bold green"),
+                border_style="green",  # Simple solid color
+                padding=(1, 2),
+                expand=True
+            )
+            main_content.append(response_panel)
+
+        # Topics Sidebar: Bold bullets if topics exist (narrow to avoid scrolling)
+        topics_content = ""
+        if topics:
+            topics_bullets = "\n".join(
+                [f"• [bold cyan]{topic}[/bold cyan]" for topic in topics[:5]])  # Limit to 5, bold
+            topics_content = Panel(
+                Text(topics_bullets, style="white"),
+                title=Text("🏷️ Key Topics", style="bold magenta"),
+                border_style="magenta",  # Simple solid color
+                padding=(1, 1),
+                width=25  # Fixed narrow width for sidebar (prevents overflow)
+            )
+
+        # Layout: Columns for response (wide) + topics (narrow sidebar) - expands to fit terminal
+        if topics_content:
+            columns_layout = Columns([response_panel, topics_content], padding=(0, 1), expand=True)
         else:
-            ai_panel = Panel(
-                ai_response,
-                title="[bold green]🤖 Assistant[/bold green]",
-                subtitle=quality_info,
-                border_style="green",
-                padding=(1, 2),
-                expand=False
+            columns_layout = response_panel  # No sidebar if no topics
+
+        self.console.print(columns_layout)
+
+        # 4. Quality Footer (badge-style, simple cyan)
+        if quality_info:
+            quality_panel = Panel(
+                Text(quality_info, style="bold dim"),
+                title="📊 Processing Metrics",
+                border_style="cyan",  # Simple solid color
+                padding=(0, 1),
+                expand=True
             )
-        self.console.print(ai_panel)
-        self.console.print(Rule(style="dim"))
+            self.console.print(quality_panel)
+
+        # 5. Styled Divider (simple dim style)
+        self.console.print(Rule("─🤖─", style="dim"))  # Simple dim color
+        self.console.print()  # Extra newline for vertical spacing
 
     def show_agent_progress(self, message: str):
         """Show detailed agent processing with animated progress bars"""
