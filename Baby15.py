@@ -75,11 +75,17 @@ logging.basicConfig(
     force=True
 )
 logger = logging.getLogger(__name__)
+import sys
+print(f"Python executable: {sys.executable}")
+print(f"Python path: {sys.path}")
+
 try:
     import PyPDF2
     PDF_SUPPORT = True
-except ImportError:
+    print("PyPDF2 imported successfully")
+except ImportError as e:
     PDF_SUPPORT = False
+    print(f"PyPDF2 import failed: {e}")
     logger.warning("PyPDF2 not installed. PDF text extraction disabled.")
 
 # --- Decorators ---
@@ -690,6 +696,7 @@ class TextFileManager:
 
     @log_errors
     def process_uploaded_file(self, file_path: str, user_id: str) -> Optional[Document]:
+        """Process uploaded files including PDFs with proper error handling"""
         try:
             file_path = Path(file_path)
 
@@ -706,7 +713,6 @@ class TextFileManager:
             # Check read permissions
             if not os.access(file_path, os.R_OK):
                 logger.error(f"No read permission for file: {file_path}")
-                # Try to change permissions (if possible)
                 try:
                     os.chmod(file_path, 0o644)
                     logger.info(f"Changed permissions for: {file_path}")
@@ -718,9 +724,45 @@ class TextFileManager:
             file_type = mimetypes.guess_type(file_path)[0] or 'text/plain'
             content = ""
 
-            # Read file based on type
-            if file_type.startswith('text/') or file_type in ['application/json', 'application/xml']:
-                # Try multiple encodings
+            # ========== PDF HANDLING (FIX #1) ==========
+            if file_type == 'application/pdf':
+                if PDF_SUPPORT:
+                    try:
+                        logger.info(f"Starting PDF extraction: {file_path.name}")
+                        with open(file_path, 'rb') as f:
+                            pdf_reader = PyPDF2.PdfReader(f)
+                            num_pages = len(pdf_reader.pages)
+                            logger.info(f"PDF has {num_pages} pages")
+
+                            content = f"=== PDF: {file_path.name} ({num_pages} pages) ===\n\n"
+
+                            for page_num in range(num_pages):
+                                try:
+                                    page = pdf_reader.pages[page_num]
+                                    text = page.extract_text()
+
+                                    if text and text.strip():
+                                        content += f"--- PAGE {page_num + 1} ---\n{text}\n\n"
+                                        logger.info(f"Extracted {len(text)} chars from page {page_num + 1}")
+                                    else:
+                                        logger.warning(f"Page {page_num + 1} returned empty text")
+                                        content += f"--- PAGE {page_num + 1} ---\n[Page appears empty or unreadable]\n\n"
+
+                                except Exception as page_error:
+                                    logger.error(f"Error extracting page {page_num + 1}: {page_error}")
+                                    content += f"--- PAGE {page_num + 1} ---\n[Error: {str(page_error)}]\n\n"
+
+                            logger.info(f"PDF extraction complete. Total content: {len(content)} chars")
+
+                    except Exception as pdf_error:
+                        logger.error(f"PDF extraction failed: {pdf_error}")
+                        logger.error(f"Full error: {type(pdf_error).__name__}: {pdf_error}")
+                        content = f"[PDF file: {file_path.name} - Extraction error: {str(pdf_error)}]"
+                else:
+                    content = f"[PDF file: {file_path.name} - PyPDF2 not available]"
+
+            # ========== TEXT FILES ==========
+            elif file_type.startswith('text/') or file_type in ['application/json', 'application/xml']:
                 encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
                 content_read = False
 
@@ -741,21 +783,7 @@ class TextFileManager:
                     logger.error(f"File appears empty or unreadable: {file_path}")
                     content = f"[File: {file_path.name} - Could not extract text content]"
 
-            elif file_type == 'application/pdf':
-                if PDF_SUPPORT:
-                    try:
-                        with open(file_path, 'rb') as f:
-                            pdf_reader = PyPDF2.PdfReader(f)
-                            content = ""
-                            for page in pdf_reader.pages:
-                                content += page.extract_text() + "\n"
-                        logger.info(f"Extracted {len(content)} chars from PDF")
-                    except Exception as pdf_error:
-                        logger.error(f"PDF extraction failed: {pdf_error}")
-                        content = f"[PDF file: {file_path.name} - extraction error]"
-                else:
-                    content = f"[PDF file: {file_path.name} - install PyPDF2 for text extraction]"
-
+            # ========== MARKDOWN FILES ==========
             elif file_type in ['text/markdown', 'text/x-markdown']:
                 try:
                     with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -764,6 +792,7 @@ class TextFileManager:
                     logger.error(f"Failed to read markdown: {e}")
                     content = f"[Markdown file: {file_path.name} - read error]"
 
+            # ========== CSV FILES ==========
             elif file_type == 'text/csv':
                 try:
                     with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -772,6 +801,7 @@ class TextFileManager:
                     logger.error(f"Failed to read CSV: {e}")
                     content = f"[CSV file: {file_path.name} - read error]"
 
+            # ========== BINARY FILES ==========
             else:
                 content = f"[Binary file: {file_path.name} ({file_type}) - content not extractable]"
                 logger.info(f"Binary file type detected: {file_type}")
@@ -805,7 +835,8 @@ class TextFileManager:
                     'original_path': str(file_path.absolute()),
                     'processed_at': datetime.now().isoformat(),
                     'content_length': len(content),
-                    'readable': bool(content and not content.startswith('['))
+                    'readable': bool(content and not content.startswith('[')),
+                    'pdf_support': PDF_SUPPORT if file_type == 'application/pdf' else None
                 }
             )
 
@@ -824,6 +855,36 @@ class TextFileManager:
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
             return None
+
+    # STEP 3: Add this debug method to TextFileManager class
+    @log_errors
+    def verify_pdf_extraction(self, user_id: str) -> Dict[str, Any]:
+        """Verify that PDFs are being extracted and readable"""
+        documents = self.get_user_documents(user_id, 100)
+        pdf_results = []
+
+        for doc in documents:
+            if 'pdf' in doc.file_type.lower():
+                result = {
+                    'filename': doc.filename,
+                    'file_type': doc.file_type,
+                    'content_length': len(doc.content),
+                    'has_content': bool(doc.content and doc.content.strip()),
+                    'content_preview': doc.content[:200] if doc.content else "[No content]",
+                    'readable': doc.metadata.get('readable', False),
+                    'upload_time': doc.upload_time.isoformat()
+                }
+                pdf_results.append(result)
+                logger.info(f"PDF verification: {doc.filename}")
+                logger.info(f"  - Content length: {result['content_length']}")
+                logger.info(f"  - Has content: {result['has_content']}")
+                logger.info(f"  - Preview: {result['content_preview'][:100]}")
+
+        return {
+            'total_pdfs': len(pdf_results),
+            'pdfs': pdf_results,
+            'pdf_support_available': PDF_SUPPORT
+        }
 
     @log_errors
     def debug_document_context(self, user_id: str):
@@ -3802,6 +3863,21 @@ class RichMultiAgentCLI:
 
                 elif command == "routing":
                     self.display_routing_stats()
+                    Prompt.ask("[bold]Press Enter to continue...[/bold]")
+
+                elif command == "test-pdf":
+                    results = self.assistant.file_manager.verify_pdf_extraction(self.user_id)
+
+                    if results['total_pdfs'] == 0:
+                        self.console.print("[yellow]No PDFs found to test[/yellow]")
+                    else:
+                        for pdf in results['pdfs']:
+                            self.console.print(f"\n[bold cyan]PDF: {pdf['filename']}[/bold cyan]")
+                            self.console.print(f"  Content length: {pdf['content_length']} chars")
+                            self.console.print(f"  Has content: {pdf['has_content']}")
+                            self.console.print(f"  Readable: {pdf['readable']}")
+                            self.console.print(f"  Preview: {pdf['content_preview'][:150]}...")
+
                     Prompt.ask("[bold]Press Enter to continue...[/bold]")
 
 
