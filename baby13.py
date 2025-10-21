@@ -1,12 +1,8 @@
-import lazycook
+import lazycook5
 import asyncio
-# Create configured assistant
-config=lazycook.create_assistant(api_key="Your_gemini_api_key",conversation_limit=70)
 
+# Create configured assistant factory
+config = lazycook5.create_assistant("GEMINI_API_KEY", conversation_limit=90)
 
-# Run CLI
+# Run CLI - config is a MultiAgentAssistantConfig, not AutonomousMultiAgentAssistant
 asyncio.run(config.run_cli())
-
-
-# Or create assistant instance directly
-assistant=config.create_assistant()
