@@ -1,3 +1,4 @@
+#OLD VERSION
 import asyncio
 import hashlib
 import json
@@ -3681,4 +3682,5 @@ def create_assistant(api_key: str, conversation_limit: int = 70):
     return config.create_assistant()
 
 if __name__ == "__main__":
+
     main()
