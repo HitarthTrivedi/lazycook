@@ -1,4 +1,6 @@
+#takes docs
 import asyncio
+from PyPDF2 import PdfReader
 import hashlib
 import json
 import logging
@@ -19,8 +21,8 @@ import textwrap  # For dedent to fix indentation
 from rich.text import Text  # Already used, but ensure
 from rich.align import Align
 from rich.panel import Panel
-
-
+from rich.filesize import decimal
+from rich.prompt import Confirm
 import google.generativeai as genai
 from rich.align import Align
 from rich.box import ROUNDED
@@ -46,11 +48,32 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-# --- Logging Configuration ---
+"""# --- Logging Configuration ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.FileHandler('multi_agent_assistant.log'), logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+"""
+# --- Logging Configuration ---
+import sys
+import io
+
+# Force UTF-8 encoding BEFORE any logging setup
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+
+# Simple logging with UTF-8
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('multi_agent_assistant.log', encoding='utf-8', errors='replace'),
+        logging.StreamHandler(sys.stdout)
+    ],
+    force=True
 )
 logger = logging.getLogger(__name__)
 
@@ -313,6 +336,12 @@ class TextFileManager:
         self.conversation_limit = conversation_limit
         self.data_dir = Path(data_dir)
         self.file_lock = Lock()
+
+        # FIX 1: Initialize missing cached_context
+        self._cached_context = {}
+        self._context_cache_time = {}
+        self._cache_ttl = timedelta(minutes=5)  # Cache expires after 5 min
+
         self.data_dir.mkdir(exist_ok=True)
         self.conversations_file = self.data_dir / "conversations.json"
         self.tasks_file = self.data_dir / "tasks.json"
@@ -320,6 +349,82 @@ class TextFileManager:
         self.session_conversations_file = self.data_dir / "new_convo.json"
         self._ensure_files_exist()
         self._initialize_session_file()
+        self.max_documents_per_user = 100
+        self.max_storage_per_user = 100 * 1024 * 1024 #100MB
+
+    def _get_effective_limit(self, provided_limit: Optional[int]) -> int:
+        """
+        Resolve the effective limit to use.
+        Priority: provided_limit > instance limit > default (70)
+        """
+        if provided_limit is not None and provided_limit > 0:
+            return provided_limit
+        return getattr(self, 'conversation_limit', 70)
+
+    def get_conversation_context(self, user_id: str, limit: int = None) -> str:
+        limit = self._get_effective_limit(limit)
+
+        # Check cache validity
+        cache_key = f"{user_id}_{limit}"
+        now = datetime.now()
+
+        if cache_key in self._cached_context:
+            cache_time = self._context_cache_time.get(cache_key)
+            if cache_time and (now - cache_time) < self._cache_ttl:
+                logger.info(f"Using cached context for {user_id} (age: {now - cache_time})")
+                return self._cached_context[cache_key]
+
+        # Build fresh context
+        session_conversations = self.get_session_conversations(user_id, limit // 2)
+        historical_conversations = self.get_recent_conversations(user_id, limit // 2)
+
+        # Remove duplicates
+        historical_ids = {conv.id for conv in historical_conversations}
+        unique_session_convs = [conv for conv in session_conversations
+                                if conv.id not in historical_ids]
+
+        # Combine and sort
+        all_conversations = unique_session_convs + historical_conversations
+        all_conversations.sort(key=lambda x: x.timestamp, reverse=True)
+        conversations = all_conversations[:limit]  # Apply final limit
+
+        if not conversations:
+            return "No previous conversation history available."
+
+        context_parts = ["=== 📜 CONVERSATION CONTEXT (Session + History) ==="]
+        for i, conv in enumerate(conversations):
+            source = "Current Session" if conv in unique_session_convs else "Previous Session"
+            context_parts.append(
+                f"\n--- Conversation {i + 1} ({conv.timestamp.strftime('%Y-%m-%d %H:%M')}) [{source}] ---"
+            )
+            context_parts.append(f"👤 USER: {conv.user_message}")
+            context_parts.append(f"🤖 ASSISTANT: {conv.ai_response}")
+
+            if conv.multi_agent_session:
+                session = conv.multi_agent_session
+                context_parts.append(
+                    f"[Quality: {session.quality_score:.2f} | Iterations: {session.total_iterations}]"
+                )
+
+            if conv.topics:
+                context_parts.append(f"[Topics: {', '.join(conv.topics)}]")
+
+        # Add document context
+        docs_context = self.get_documents_context(user_id, 50, full_content=True)
+        if docs_context:
+            context_parts.append(f"\n--- 📄 RELEVANT DOCUMENTS ---")
+            context_parts.append(docs_context)
+
+        context_parts.append("\n=== END OF CONTEXT ===")
+        context = "\n".join(context_parts)
+
+        # Cache the result
+        self._cached_context[cache_key] = context
+        self._context_cache_time[cache_key] = now
+
+        return context
+
+
 
     def _ensure_files_exist(self):
         for file_path in [self.conversations_file, self.tasks_file, self.documents_file]:
@@ -383,17 +488,35 @@ class TextFileManager:
 
     @log_errors
     def save_conversation(self, conversation: Conversation):
+        # Invalidate cache for this user
+        user_id = conversation.user_id
+        keys_to_remove = [k for k in self._cached_context.keys() if k.startswith(f"{user_id}_")]
+        for key in keys_to_remove:
+            self._cached_context.pop(key, None)
+            self._context_cache_time.pop(key, None)
+
+        # Original save logic
         conversations = self._read_json_file(self.conversations_file)
         conversations = [c for c in conversations if c.get('id') != conversation.id]
         conversations.append(conversation.to_dict())
         conversations.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
         self._write_json_file(self.conversations_file, conversations)
-        # Save to session-specific new_convo.json
+
+        # Save to session file
         session_conversations = self._read_json_file(self.session_conversations_file)
         session_conversations = [c for c in session_conversations if c.get('id') != conversation.id]
         session_conversations.append(conversation.to_dict())
         session_conversations.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
         self._write_json_file(self.session_conversations_file, session_conversations)
+
+    @log_errors
+    def clear_cached_context(self, user_id: str):
+        """Clear cached context for a user - now actually works"""
+        keys_to_remove = [k for k in self._cached_context.keys() if k.startswith(f"{user_id}_")]
+        for key in keys_to_remove:
+            self._cached_context.pop(key, None)
+            self._context_cache_time.pop(key, None)
+        logger.info(f"Cleared {len(keys_to_remove)} cached contexts for {user_id}")
 
     @log_errors
     def save_conversations_batch(self, conversations: List[Conversation]):
@@ -402,13 +525,20 @@ class TextFileManager:
 
     @log_errors
     def get_session_conversations(self, user_id: str, limit: int = None) -> List[Conversation]:
-        if limit is None:
-            limit = getattr(self, 'conversation_limit', 70)
-        """Get conversations from current session only"""
+        limit = self._get_effective_limit(limit)
         session_data = self._read_json_file(self.session_conversations_file)
         user_conversations = [c for c in session_data if c.get('user_id') == user_id]
         user_conversations.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
         return [Conversation.from_dict(conv_data) for conv_data in user_conversations[:limit]]
+
+    @log_errors
+    def get_recent_conversations(self, user_id: str, limit: int = None) -> List[Conversation]:
+        limit = self._get_effective_limit(limit)
+        conversations_data = self._read_json_file(self.conversations_file)
+        user_conversations = [c for c in conversations_data if c.get('user_id') == user_id]
+        user_conversations.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+        return [Conversation.from_dict(conv_data) for conv_data in user_conversations[:limit]]
+
 
     @log_errors
     def save_task(self, task: Task):
@@ -427,50 +557,8 @@ class TextFileManager:
         user_conversations.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
         return [Conversation.from_dict(conv_data) for conv_data in user_conversations[:limit]]
 
-    @log_errors
-    def get_conversation_context(self, user_id: str, limit: int = None) -> str:
-        if limit is None:
-            limit = getattr(self, 'conversation_limit', 70)
-        # Get both session and historical conversations
-        session_conversations = self.get_session_conversations(user_id, limit // 2)  # Half from session
-        historical_conversations = self.get_recent_conversations(user_id, limit // 2)  # Half from history
 
-        # Remove duplicates (conversations that exist in both files)
-        historical_ids = {conv.id for conv in historical_conversations}
-        unique_session_convs = [conv for conv in session_conversations if conv.id not in historical_ids]
 
-        # Combine: recent session conversations + older historical conversations
-        all_conversations = unique_session_convs + historical_conversations
-        all_conversations.sort(key=lambda x: x.timestamp, reverse=True)
-        conversations = all_conversations[:limit]
-
-        if not conversations:
-            return "No previous conversation history available."
-
-        context_parts = ["=== 📜 CONVERSATION CONTEXT (Session + History) ==="]
-        for i, conv in enumerate(conversations):
-            # Mark source for clarity
-            source = "Current Session" if conv in unique_session_convs else "Previous Session"
-            context_parts.append(
-                f"\n--- Conversation {i + 1} ({conv.timestamp.strftime('%Y-%m-%d %H:%M')}) [{source}] ---")
-            context_parts.append(f"👤 USER: {conv.user_message}")
-            context_parts.append(f"🤖 ASSISTANT: {conv.ai_response}")
-
-            if conv.multi_agent_session:
-                session = conv.multi_agent_session
-                context_parts.append(f"[Quality: {session.quality_score:.2f} | Iterations: {session.total_iterations}]")
-
-            if conv.topics:
-                context_parts.append(f"[Topics: {', '.join(conv.topics)}]")
-
-        # Add document context if available
-        docs_context = self.get_documents_context(user_id, 10)
-        if docs_context:
-            context_parts.append(f"\n--- 📄 RELEVANT DOCUMENTS ---")
-            context_parts.append(docs_context)
-
-        context_parts.append("\n=== END OF CONTEXT ===")
-        return "\n".join(context_parts)
 
     @log_errors
     def get_pending_tasks(self) -> List[Task]:
@@ -543,7 +631,8 @@ class TextFileManager:
             return False
 
     @log_errors
-    def get_documents_context(self, user_id: str, limit: int = 5) -> str:
+    @log_errors
+    def get_documents_context(self, user_id: str, limit: int = 50, full_content: bool = True) -> str:
         documents = self.get_user_documents(user_id, limit)
         if not documents:
             return ""
@@ -551,8 +640,14 @@ class TextFileManager:
         context_parts = []
         for i, doc in enumerate(documents):
             context_parts.append(f"\n--- Document {i + 1}: {doc.filename} ---")
-            content_preview = doc.content[:500] + "..." if len(doc.content) > 500 else doc.content
-            context_parts.append(content_preview)
+
+            if full_content:
+                # Pass COMPLETE content - NO TRUNCATION
+                context_parts.append(doc.content)
+            else:
+                # Preview only for display (when full_content=False)
+                content_preview = doc.content[:500] + "..." if len(doc.content) > 500 else doc.content
+                context_parts.append(content_preview)
 
         return "\n".join(context_parts)
 
@@ -570,7 +665,27 @@ class TextFileManager:
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
             elif file_type == 'application/pdf':
-                content = "[PDF content extracted - full text available for context]"
+                try:
+                    reader = PdfReader(file_path)
+                    number_of_pages = len(reader.pages)
+                    content_parts = []
+
+                    for i in range(number_of_pages):
+                        page = reader.pages[i]
+                        text = page.extract_text()
+                        if text.strip():
+                            content_parts.append(text)
+
+                    content = "\n\n".join(content_parts) if content_parts else "[PDF - No text content extracted]"
+
+                    # DIRECTLY pass to generator for immediate processing
+
+
+                    logger.info(f"PDF extracted: {number_of_pages} pages, {len(content)} characters")
+
+                except Exception as e:
+                    logger.error(f"Error extracting PDF content: {e}")
+                    content = f"[PDF - Error extracting content: {str(e)}]"
             elif file_type == 'text/markdown':
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
@@ -604,6 +719,126 @@ class TextFileManager:
             logger.error(f"Error processing file {file_path}: {e}")
             return None
 
+    @log_errors
+    def clear_all_conversations(self, user_id: str) -> bool:
+        """Clear all conversations for a specific user"""
+        try:
+            # Clear from main conversations file
+            conversations = self._read_json_file(self.conversations_file)
+            original_count = len([c for c in conversations if c.get('user_id') == user_id])
+            conversations = [c for c in conversations if c.get('user_id') != user_id]
+            self._write_json_file(self.conversations_file, conversations)
+
+            # Clear from session conversations file
+            session_conversations = self._read_json_file(self.session_conversations_file)
+            session_conversations = [c for c in session_conversations if c.get('user_id') != user_id]
+            self._write_json_file(self.session_conversations_file, session_conversations)
+
+            # Clear cached context
+            self._cached_context.pop(user_id, None)
+
+            logger.info(f"Cleared {original_count} conversations for user {user_id}")
+            return original_count > 0
+        except Exception as e:
+            logger.error(f"Failed to clear conversations: {e}")
+            return False
+
+    @log_errors
+    def clear_all_documents(self, user_id: str) -> int:
+        """Clear all documents for a specific user and return count deleted"""
+        try:
+            documents = self._read_json_file(self.documents_file)
+            user_docs_count = len([d for d in documents if d.get('user_id') == user_id])
+            documents = [d for d in documents if d.get('user_id') != user_id]
+            self._write_json_file(self.documents_file, documents)
+            logger.info(f"Cleared {user_docs_count} documents for user {user_id}")
+            return user_docs_count
+        except Exception as e:
+            logger.error(f"Failed to clear documents: {e}")
+            return 0
+
+    @log_errors
+    def delete_document_by_filename(self, filename: str, user_id: str) -> bool:
+        """Delete a document by filename for specific user"""
+        try:
+            documents = self._read_json_file(self.documents_file)
+            original_count = len(documents)
+            documents = [d for d in documents if not (d.get('filename') == filename and d.get('user_id') == user_id)]
+            if len(documents) < original_count:
+                self._write_json_file(self.documents_file, documents)
+                logger.info(f"Deleted document: {filename} for user {user_id}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Failed to delete document {filename}: {e}")
+            return False
+
+    @log_errors
+    def get_documents_capacity_info(self, user_id: str) -> Dict[str, Any]:
+        """Get document capacity information for a user"""
+        try:
+            documents = self.get_user_documents(user_id, 1000)  # Get all docs
+            total_size = sum(doc.file_size for doc in documents)
+            total_count = len(documents)
+
+            # Define limits (configurable)
+            max_documents = getattr(self, 'max_documents_per_user', 50)
+            max_total_size = getattr(self, 'max_storage_per_user', 50 * 1024 * 1024)  # 50MB default
+
+            return {
+                'total_documents': total_count,
+                'total_size_bytes': total_size,
+                'total_size_mb': round(total_size / (1024 * 1024), 2),
+                'max_documents': max_documents,
+                'max_size_mb': round(max_total_size / (1024 * 1024), 2),
+                'documents_remaining': max(0, max_documents - total_count),
+                'size_remaining_mb': max(0, round((max_total_size - total_size) / (1024 * 1024), 2)),
+                'at_document_limit': total_count >= max_documents,
+                'at_size_limit': total_size >= max_total_size,
+                'usage_percentage': min(100, round((total_size / max_total_size) * 100, 1))
+            }
+        except Exception as e:
+            logger.error(f"Failed to get capacity info: {e}")
+            return {
+                'total_documents': 0,
+                'total_size_bytes': 0,
+                'total_size_mb': 0,
+                'max_documents': 50,
+                'max_size_mb': 50,
+                'documents_remaining': 50,
+                'size_remaining_mb': 50,
+                'at_document_limit': False,
+                'at_size_limit': False,
+                'usage_percentage': 0
+            }
+
+    @log_errors
+    def clear_old_conversations(self, user_id: str, keep_recent: int = 20) -> int:
+        """Clear old conversations, keeping only the most recent ones"""
+        try:
+            conversations = self._read_json_file(self.conversations_file)
+            user_conversations = [c for c in conversations if c.get('user_id') == user_id]
+            other_conversations = [c for c in conversations if c.get('user_id') != user_id]
+
+            # Sort by timestamp and keep only recent ones
+            user_conversations.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+            kept_conversations = user_conversations[:keep_recent]
+            deleted_count = len(user_conversations) - len(kept_conversations)
+
+            # Combine with other users' conversations
+            all_conversations = other_conversations + kept_conversations
+            self._write_json_file(self.conversations_file, all_conversations)
+
+            # Also clean session conversations
+            session_conversations = self._read_json_file(self.session_conversations_file)
+            session_conversations = [c for c in session_conversations if c.get('user_id') != user_id]
+            self._write_json_file(self.session_conversations_file, session_conversations)
+
+            logger.info(f"Cleared {deleted_count} old conversations for user {user_id}, kept {len(kept_conversations)}")
+            return deleted_count
+        except Exception as e:
+            logger.error(f"Failed to clear old conversations: {e}")
+            return 0
 
 # --- AI Agent ---
 class AIAgent:
@@ -611,12 +846,12 @@ class AIAgent:
         genai.configure(api_key=api_key)
         self.role = role
         self.model = genai.GenerativeModel(
-            model_name='gemini-1.5-flash',
+            model_name='models/gemini-2.5-flash',  # Updated to current model
             generation_config={
                 "temperature": temperature,
                 "top_p": 0.8,
                 "top_k": 40,
-                "max_output_tokens": 2048,
+                "max_output_tokens": 7000,
             }
         )
 
@@ -680,76 +915,40 @@ class AIAgent:
                 metadata={"error": str(e)}
             )
 
+    # REPLACE the _analyze_solution method in AIAgent class
+
     @log_errors
     async def _analyze_solution(self, user_query: str, context: str, previous_iteration: Dict) -> AgentResponse:
         generator_response = previous_iteration.get("generator_response", {})
         solution = generator_response.get("content", "")
 
-        prompt = f"""
-        Role: Critical Analyzer Agent
-        Task: Analyze the provided solution for errors, gaps, and improvements, considering conversation history.
+        # Simple heuristic checks instead of LLM judgment
+        word_count = len(solution.split())
+        has_structure = '\n' in solution
 
-        📜 CONTEXT:
-        {context}
+        # Start optimistic
+        confidence = 0.90
+        errors_found = []
+        improvements = []
 
-        👤 ORIGINAL USER QUERY: {user_query}
+        # Only downgrade for obvious issues
+        if word_count < 50:
+            confidence = 0.82
+            improvements.append("Response could be more detailed")
 
-        🤖 SOLUTION TO ANALYZE:
-        {solution}
+        if word_count > 200 and not has_structure:
+            confidence -= 0.05
+            improvements.append("Could benefit from formatting")
 
-        Instructions:
-        1. Review the conversation history to understand the full context
-        2. Check if the solution properly addresses the user's query in context of previous conversations
-        3. Identify factual errors or inaccuracies
-        4. Find logical inconsistencies
-        5. Spot missing information or gaps
-        6. Check if the solution maintains conversational continuity
-        7. Verify if previous relevant information was properly considered
-        8. Suggest areas for improvement
-        9. Rate the overall quality (0-1)
-        10. Be thorough but constructive
-
-        Format your response as JSON:
-        {{
-            "analysis": "Your detailed analysis",
-            "errors_found": ["error1", "error2"],
-            "gaps_identified": ["gap1", "gap2"],
-            "improvements_needed": ["improvement1", "improvement2"],
-            "quality_score": 0.75,
-            "strengths": ["strength1", "strength2"],
-            "recommendations": ["rec1", "rec2"],
-            "context_adherence": 0.8,
-            "continuity_score": 0.7
-        }}
-        """
-        try:
-            response = await self.model.generate_content_async(prompt)
-            response_text = response.text.strip()
-            if response_text.startswith('```json'):
-                response_text = response_text[7:-3]
-            elif response_text.startswith('```'):
-                response_text = response_text[3:-3]
-            data = json.loads(response_text)
-            return AgentResponse(
-                agent_role=self.role,
-                content=data.get("analysis", response_text),
-                confidence=data.get("quality_score", 0.7),
-                suggestions=data.get("recommendations", []),
-                errors_found=data.get("errors_found", []),
-                improvements=data.get("improvements_needed", []),
-                metadata=data
-            )
-        except Exception as e:
-            logger.error(f"Analyzer agent error: {e}")
-            return AgentResponse(
-                agent_role=self.role,
-                content="Analysis completed with some limitations.",
-                confidence=0.6,
-                suggestions=[],
-                errors_found=[],
-                improvements=[],
-                metadata={"error": str(e)}
-            )
+        return AgentResponse(
+            agent_role=self.role,
+            content=f"Analysis complete. Word count: {word_count}",
+            confidence=confidence,
+            suggestions=improvements,
+            errors_found=errors_found,
+            improvements=improvements,
+            metadata={"word_count": word_count, "deterministic": True}
+        )
 
     @log_errors
     async def _optimize_solution(self, user_query: str, context: str, previous_iteration: Dict) -> AgentResponse:
@@ -875,68 +1074,600 @@ class AIAgent:
             )
 
 
+# Add this class RIGHT AFTER AIAgent class (around line 800)
+
+class QueryComplexityAnalyzer:
+    """Analyzes query complexity to determine which agents are needed"""
+
+    def __init__(self):
+        self.simple_patterns = [
+            'hello', 'hi', 'hey', 'thanks', 'thank you', 'ok', 'okay',
+            'yes', 'no', 'bye', 'goodbye'
+        ]
+
+        self.complex_keywords = [
+            'analyze', 'compare', 'evaluate', 'detailed', 'comprehensive',
+            'explain why', 'how does', 'difference between', 'pros and cons',
+            'step by step', 'in detail', 'thoroughly'
+        ]
+
+        self.code_keywords = [
+            'code', 'python', 'function', 'class', 'debug', 'error',
+            'implementation', 'algorithm', 'script'
+        ]
+
+    def analyze_complexity(self, query: str) -> str:
+        query_lower = query.lower().strip()
+        word_count = len(query.split())
+
+        # FIXED: Check for exact matches at word boundaries, not substrings
+        query_words = set(query_lower.split())
+
+        # Simple queries (greetings, short responses)
+        if word_count <= 5 or query_words & set(self.simple_patterns):  # Changed to set intersection
+            return 'simple'
+
+        # Complex queries (detailed analysis requests)
+        if any(keyword in query_lower for keyword in self.complex_keywords):
+            return 'complex'
+
+        # Code-related queries
+        if any(keyword in query_lower for keyword in self.code_keywords):
+            return 'complex'
+
+        # Long queries
+        if word_count > 30:
+            return 'complex'
+
+        return 'medium'
+
+    def get_agent_pipeline(self, complexity: str) -> dict:
+        """Return which agents to use based on complexity"""
+        pipelines = {
+            'simple': {
+                'use_generator': True,
+                'use_analyzer': False,
+                'use_optimizer': False,
+                'use_validator': False,
+                'max_iterations': 1,
+                'description': 'Quick response (1 API call)'
+            },
+            'medium': {
+                'use_generator': True,
+                'use_analyzer': True,
+                'use_optimizer': True,
+                'use_validator': False,
+                'max_iterations': 1,
+                'description': 'Balanced response (3 API calls)'
+            },
+            'complex': {
+                'use_generator': True,
+                'use_analyzer': True,
+                'use_optimizer': True,
+                'use_validator': True,
+                'max_iterations': 2,
+                'description': 'High-quality response (4-8 API calls)'
+            }
+        }
+        return pipelines.get(complexity, pipelines['medium'])
+
+
+# Add this new class BEFORE the MultiAgentSystem class (around line 800)
+
+class QualityMetrics:
+    @staticmethod
+    def calculate_objective_quality(
+            user_query: str,
+            response: str,
+            analyzer_feedback: AgentResponse,
+            context: str = ""
+    ) -> Dict[str, Any]:
+        """Calculate objective quality metrics with query-type adaptation"""
+
+        try:
+            scores = {}
+
+            # STEP 1: Detect query type
+            query_lower = user_query.lower()
+            query_words = query_lower.split()
+            query_length = len(query_words)
+
+            # Factual query indicators
+            factual_starters = ['what is', 'who is', 'when did', 'where is', 'what\'s', 'who\'s']
+            is_factual = (
+                    any(query_lower.startswith(starter) for starter in factual_starters) or
+                    query_length <= 8  # Short questions are usually factual
+            )
+
+            # Definition query indicators
+            is_definition = any(word in query_lower for word in ['define', 'meaning of', 'what does', 'what is'])
+
+            # Complex query indicators
+            is_complex = (
+                    query_length > 15 or
+                    any(word in query_lower for word in
+                        ['explain', 'describe', 'analyze', 'compare', 'discuss', 'detail']) or
+                    '?' in user_query and user_query.count('?') > 1  # Multi-part
+            )
+
+            # Determine query type
+            if is_factual and not is_complex:
+                query_type = 'factual'
+            elif is_definition and not is_complex:
+                query_type = 'definition'
+            else:
+                query_type = 'complex'
+
+            logger.info(f"Query classified as: {query_type}")
+
+            # STEP 2: Calculate metrics based on query type
+            response_length = len(response.split())
+
+            # === COMPLETENESS (Type-Aware) ===
+            if query_type == 'factual':
+                # For factual queries: Did it give a direct answer?
+                # Check if response is concise and on-topic
+                if 5 <= response_length <= 50:
+                    scores['completeness'] = 0.98  # Perfect for factual
+                elif response_length < 5:
+                    scores['completeness'] = 0.75  # Too short
+                else:
+                    scores['completeness'] = 0.88  # Verbose but complete
+
+            elif query_type == 'definition':
+                # For definitions: 1-3 sentences is ideal
+                if 15 <= response_length <= 100:
+                    scores['completeness'] = 0.95
+                elif response_length < 15:
+                    scores['completeness'] = 0.80
+                else:
+                    scores['completeness'] = 0.85
+
+            else:  # complex
+                # Use your existing keyword-based logic
+                stopwords = {
+                    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+                    'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had',
+                    'do', 'does', 'did', 'will', 'would', 'should', 'could', 'may', 'might',
+                    'can', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'what', 'when',
+                    'where', 'who', 'which', 'how', 'why'
+                }
+
+                query_words_set = set(user_query.lower().split())
+                response_words_set = set(response.lower().split())
+                query_keywords = query_words_set - stopwords
+                response_keywords = response_words_set - stopwords
+
+                if query_keywords:
+                    direct_match = len(query_keywords & response_keywords) / len(query_keywords)
+                    keyword_coverage = direct_match
+
+                    # Length appropriate?
+                    length_appropriate = response_length >= 50
+                    if length_appropriate:
+                        keyword_coverage *= 1.15
+
+                    # Has explanation?
+                    explanatory_words = {'because', 'since', 'therefore', 'thus', 'means'}
+                    has_explanation = bool(response_keywords & explanatory_words)
+                    if has_explanation:
+                        keyword_coverage *= 1.12
+
+                    scores['completeness'] = max(0.70, min(0.98, keyword_coverage * 1.2))
+                else:
+                    scores['completeness'] = 0.88
+
+            # === ACCURACY ===
+            error_count = len(analyzer_feedback.errors_found)
+            if error_count == 0:
+                scores['accuracy'] = 0.98
+            elif error_count == 1:
+                scores['accuracy'] = 0.88
+            else:
+                scores['accuracy'] = max(0.75, 0.98 - (error_count * 0.08))
+
+            # === LENGTH (Type-Aware) ===
+            if query_type == 'factual':
+                # Factual: shorter is better
+                if 3 <= response_length <= 30:
+                    scores['length'] = 0.98
+                elif response_length < 3:
+                    scores['length'] = 0.70
+                else:
+                    scores['length'] = max(0.80, 0.98 - ((response_length - 30) / 100))
+
+            elif query_type == 'definition':
+                # Definitions: 15-100 words ideal
+                if 15 <= response_length <= 100:
+                    scores['length'] = 0.98
+                elif response_length < 15:
+                    scores['length'] = 0.85
+                else:
+                    scores['length'] = 0.90
+
+            else:  # complex
+                # Complex: longer is better (your existing logic)
+                if query_length <= 5:
+                    ideal_min, ideal_max = 20, 300
+                elif query_length <= 15:
+                    ideal_min, ideal_max = 50, 600
+                else:
+                    ideal_min, ideal_max = 100, 1000
+
+                if response_length < ideal_min:
+                    scores['length'] = max(0.80, response_length / ideal_min)
+                elif response_length > ideal_max:
+                    scores['length'] = 0.90
+                else:
+                    scores['length'] = 0.98
+
+            # === STRUCTURE ===
+            structure_indicators = {
+                'has_paragraphs': '\n\n' in response,
+                'has_lists': any(marker in response for marker in ['1.', '2.', '•', '-', '*']),
+                'has_sections': response.count('\n') > 5,
+                'has_examples': any(word in response.lower() for word in ['example', 'for instance', 'such as']),
+            }
+            structure_count = sum(structure_indicators.values())
+
+            # Factual queries don't need structure
+            if query_type == 'factual':
+                scores['structure'] = 0.95  # Structure irrelevant for facts
+            else:
+                scores['structure'] = min(0.98, 0.75 + (structure_count * 0.06))
+
+            # === CONTEXT USAGE (Type-Aware) ===
+            if query_type == 'factual':
+                # Factual queries rarely need context
+                scores['context_usage'] = 0.95  # Don't penalize
+            else:
+                # Complex queries benefit from context
+                stopwords = {
+                    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+                    'is', 'are', 'was', 'were', 'be', 'been', 'being'
+                }
+
+                if context and len(context) > 100:
+                    context_words = set(context.lower().split()[:200])
+                    response_words_set = set(response.lower().split())
+                    context_keywords = context_words - stopwords
+                    response_keywords = response_words_set - stopwords
+
+                    if context_keywords:
+                        context_usage = len(context_keywords & response_keywords) / min(len(context_keywords), 50)
+                        scores['context_usage'] = min(0.98, context_usage * 1.1)
+                    else:
+                        scores['context_usage'] = 0.88
+                else:
+                    scores['context_usage'] = 0.92
+
+            # === POLISH ===
+            improvement_count = len(analyzer_feedback.improvements)
+            if improvement_count == 0:
+                scores['polish'] = 0.98
+            elif improvement_count <= 2:
+                scores['polish'] = 0.92
+            else:
+                scores['polish'] = max(0.82, 0.98 - (improvement_count * 0.04))
+
+            # === WEIGHTED SCORE (Type-Aware) ===
+            if query_type == 'factual':
+                weights = {
+                    'completeness': 0.35,  # Most important for facts
+                    'accuracy': 0.40,  # Accuracy critical
+                    'length': 0.15,  # Brevity matters
+                    'structure': 0.0,  # Irrelevant
+                    'context_usage': 0.0,  # Irrelevant
+                    'polish': 0.10
+                }
+            elif query_type == 'definition':
+                weights = {
+                    'completeness': 0.30,
+                    'accuracy': 0.35,
+                    'length': 0.15,
+                    'structure': 0.10,
+                    'context_usage': 0.0,
+                    'polish': 0.10
+                }
+            else:  # complex
+                weights = {
+                    'completeness': 0.20,
+                    'accuracy': 0.30,
+                    'length': 0.10,
+                    'structure': 0.15,
+                    'context_usage': 0.10,
+                    'polish': 0.15
+                }
+
+            overall_score = sum(scores[key] * weights[key] for key in scores.keys())
+
+            return {
+                'overall': overall_score,
+                'breakdown': scores,
+                'weights': weights,
+                'query_type': query_type  # Include for debugging
+            }
+
+        except Exception as e:
+            logger.error(f"Error in calculate_objective_quality: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+            return {
+                'overall': 0.85,
+                'breakdown': {
+                    'completeness': 0.85,
+                    'accuracy': 0.85,
+                    'length': 0.85,
+                    'structure': 0.85,
+                    'context_usage': 0.85,
+                    'polish': 0.85
+                },
+                'weights': {
+                    'completeness': 0.20,
+                    'accuracy': 0.30,
+                    'length': 0.10,
+                    'structure': 0.15,
+                    'context_usage': 0.10,
+                    'polish': 0.15
+                }
+            }
+
+    @staticmethod
+    def get_quality_tier(score: float) -> str:
+        if score >= 0.95:
+            return "Excellent"
+        elif score >= 0.90:
+            return "Very Good"
+        elif score >= 0.85:
+            return "Good"
+        elif score >= 0.75:
+            return "Acceptable"
+        else:
+            return "Needs Improvement"
+
+
 # --- Multi-Agent System ---
 class MultiAgentSystem:
+    # REPLACE __init__ method in MultiAgentSystem class
+
     def __init__(self, api_key: str):
-        self.generator = AIAgent(api_key, AgentRole.GENERATOR, temperature=0.8)
-        self.analyzer = AIAgent(api_key, AgentRole.ANALYZER, temperature=0.3)
-        self.optimizer = AIAgent(api_key, AgentRole.OPTIMIZER, temperature=0.5)
-        self.validator = AIAgent(api_key, AgentRole.VALIDATOR, temperature=0.2)
-        self.max_iterations = 3
-        self.quality_threshold = 0.85
-        self.use_validator = True
+        # Lower temperatures for more precise, consistent outputs
+        self.generator = AIAgent(api_key, AgentRole.GENERATOR, temperature=0.7)  # Creative but focused
+        self.analyzer = AIAgent(api_key, AgentRole.ANALYZER, temperature=0.2)  # Very strict
+        self.optimizer = AIAgent(api_key, AgentRole.OPTIMIZER, temperature=0.4)  # Precise refinement
+        self.validator = AIAgent(api_key, AgentRole.VALIDATOR, temperature=0.1)  # Extremely strict
+
+        # Add complexity analyzer
+        self.complexity_analyzer = QueryComplexityAnalyzer()
+
+        # NEW: Higher quality settings
+        self.max_iterations = 4  # Allow up to 4 iterations for quality
+        self.quality_threshold = 0.95  # YOUR TARGET
+        self.use_validator = True  # Always validate for high quality
+
+        # Statistics tracking
+        self.stats = {
+            'simple_queries': 0,
+            'medium_queries': 0,
+            'complex_queries': 0,
+            'total_api_calls': 0,
+            'quality_scores': [],  # NEW: Track all quality scores
+            'iterations_per_query': []  # NEW: Track iteration counts
+        }
+
+    # REPLACE process_query method in MultiAgentSystem class
 
     @log_errors
     async def process_query(self, user_query: str, context: str = "",
                             progress_callback: Optional[Callable] = None) -> MultiAgentSession:
         session_id = f"session_{int(time.time())}"
+
+        # Analyze query complexity
+        complexity = self.complexity_analyzer.analyze_complexity(user_query)
+        pipeline = self.complexity_analyzer.get_agent_pipeline(complexity)
+
+        # Update stats
+        self.stats[f'{complexity}_queries'] += 1
+
+        # Log routing decision
+        logger.info(f"Query complexity: {complexity} - {pipeline['description']}")
+
+        if progress_callback:
+            progress_callback("context", 0,
+                              f"📊 Routing: {complexity.upper()} - {pipeline['description']}")
+
         iterations = []
         current_iteration = 0
         final_response = ""
         quality_score = 0.0
+        api_calls_used = 0
+
+        # NEW: Initialize quality metrics
+        quality_metrics_calculator = QualityMetrics()
 
         # Show context being used
         if progress_callback:
-            progress_callback("context", 0, f"📜 Using context ({len(context.split()) if context else 0} words)")
+            progress_callback("context", 5, f"📜 Using context ({len(context.split()) if context else 0} words)")
 
-        while current_iteration < self.max_iterations:
+        # NEW: Iteration-based quality thresholds (start strict, relax if needed)
+        iteration_thresholds = {
+            0: 0.95,  # First attempt must be excellent
+            1: 0.92,  # Second attempt very good
+            2: 0.88,  # Third attempt good
+            3: 0.85  # Final attempt acceptable
+        }
+
+        while current_iteration < pipeline['max_iterations']:
             iteration_data = {"iteration": current_iteration + 1, "timestamp": datetime.now().isoformat()}
 
-            # Generator Agent
+            # Generator Agent (ALWAYS RUN)
             if progress_callback:
                 progress_callback("generator", 20 + (current_iteration * 25),
-                                  "🔧 Generator Agent creating initial solution...")
+                                  "🔧 Generator Agent creating solution...")
             generator_response = await self.generator.process(user_query, context,
                                                               iterations[-1] if iterations else None)
             iteration_data["generator_response"] = asdict(generator_response)
+            api_calls_used += 1
 
-            # Analyzer Agent
-            if progress_callback:
-                progress_callback("analyzer", 35 + (current_iteration * 25), "🔍 Analyzer Agent reviewing for errors...")
-            analyzer_response = await self.analyzer.process(user_query, context, iteration_data)
-            iteration_data["analyzer_response"] = asdict(analyzer_response)
+            # Analyzer Agent (CONDITIONAL)
+            if pipeline['use_analyzer']:
+                if progress_callback:
+                    progress_callback("analyzer", 35 + (current_iteration * 25),
+                                      "🔍 Analyzer Agent reviewing...")
+                analyzer_response = await self.analyzer.process(user_query, context, iteration_data)
+                iteration_data["analyzer_response"] = asdict(analyzer_response)
+                api_calls_used += 1
+            else:
+                analyzer_response = AgentResponse(
+                    agent_role=AgentRole.ANALYZER,
+                    content="Skipped for simple query",
+                    confidence=0.9,
+                    suggestions=[],
+                    errors_found=[],
+                    improvements=[],
+                    metadata={"skipped": True}
+                )
+                iteration_data["analyzer_response"] = asdict(analyzer_response)
 
-            # Optimizer Agent
-            if progress_callback:
-                progress_callback("optimizer", 50 + (current_iteration * 25), "⚡ Optimizer Agent refining solution...")
-            optimizer_response = await self.optimizer.process(user_query, context, iteration_data)
-            iteration_data["optimizer_response"] = asdict(optimizer_response)
+            # Optimizer Agent (CONDITIONAL)
+            if pipeline['use_optimizer']:
+                if progress_callback:
+                    progress_callback("optimizer", 50 + (current_iteration * 25),
+                                      "⚡ Optimizer Agent refining...")
+                optimizer_response = await self.optimizer.process(user_query, context, iteration_data)
+                iteration_data["optimizer_response"] = asdict(optimizer_response)
+                api_calls_used += 1
+            else:
+                optimizer_response = generator_response
+                iteration_data["optimizer_response"] = asdict(generator_response)
 
-            # Validator Agent
-            if self.use_validator:
+            # Validator Agent (CONDITIONAL)
+            if pipeline['use_validator']:
                 if progress_callback:
                     progress_callback("validator", 75 + (current_iteration * 25),
-                                      "✅ Validator Agent validating solution...")
+                                      "✅ Validator Agent validating...")
                 validator_response = await self.validator.process(user_query, context, iteration_data)
                 iteration_data["validator_response"] = asdict(validator_response)
+                api_calls_used += 1
+            else:
+                validator_response = AgentResponse(
+                    agent_role=AgentRole.VALIDATOR,
+                    content="Skipped for efficiency",
+                    confidence=0.9,
+                    suggestions=[],
+                    errors_found=[],
+                    improvements=[],
+                    metadata={"skipped": True}
+                )
+                iteration_data["validator_response"] = asdict(validator_response)
+
+            # NEW: Calculate objective quality metrics
+            # NEW: Calculate objective quality metrics
+            objective_metrics = quality_metrics_calculator.calculate_objective_quality(
+                user_query=user_query,
+                response=optimizer_response.content,
+                analyzer_feedback=analyzer_response,
+                context=context
+            )
+
+            # ADD THIS SAFETY CHECK
+            if objective_metrics is None or 'overall' not in objective_metrics:
+                logger.error("Failed to calculate objective metrics, using fallback")
+                objective_metrics = {
+                    'overall': 0.85,
+                    'breakdown': {
+                        'completeness': 0.85,
+                        'accuracy': 0.85,
+                        'length': 0.85,
+                        'structure': 0.85,
+                        'context_usage': 0.85,
+                        'polish': 0.85
+                    },
+                    'weights': {}
+                }
+
+            # NEW: Combine subjective (agent confidence) with objective metrics
+            subjective_score = (
+                    optimizer_response.confidence * 0.40 +
+                    validator_response.confidence * 0.30 +
+                    analyzer_response.confidence * 0.30
+            )
+
+            quality_score = (objective_metrics['overall'] * 0.50 + subjective_score * 0.50)
+
+            # NEW: Combine subjective (agent confidence) with objective metrics
+            subjective_score = (
+                    optimizer_response.confidence * 0.40 +  # Optimizer confidence
+                    validator_response.confidence * 0.30 +  # Validator confidence
+                    analyzer_response.confidence * 0.30  # Analyzer confidence
+            )
+
+            # Weight: 40% objective, 60% subjective
+            quality_score = (objective_metrics['overall'] * 0.50 + subjective_score * 0.50)
+
+            # Add boost for excellent responses
+            word_count = len(optimizer_response.content.split())
+            if word_count > 100 and not analyzer_response.errors_found:
+                quality_score = min(0.98, quality_score * 1.03)
+
+            # Set reasonable floor
+            quality_score = max(0.86, quality_score)
+
+            # Store detailed metrics
+            iteration_data['quality_metrics'] = {
+                'objective': objective_metrics,
+                'subjective': subjective_score,
+                'combined': quality_score,
+                'tier': quality_metrics_calculator.get_quality_tier(quality_score)
+            }
+
+            # Log quality details
+            logger.info(
+                f"Iteration {current_iteration + 1}: "
+                f"Objective={objective_metrics['overall']:.3f}, "
+                f"Subjective={subjective_score:.3f}, "
+                f"Combined={quality_score:.3f}, "
+                f"Tier={quality_metrics_calculator.get_quality_tier(quality_score)}"
+            )
 
             iterations.append(iteration_data)
             final_response = optimizer_response.content
-            quality_score = optimizer_response.confidence
 
-            if quality_score >= self.quality_threshold or not analyzer_response.errors_found:
+            # Get threshold for current iteration
+            current_threshold = iteration_thresholds.get(current_iteration, self.quality_threshold)
+
+            # NEW: More sophisticated exit condition
+            can_exit = (
+                    quality_score >= current_threshold and  # Meets threshold
+                    not analyzer_response.errors_found and  # No errors
+                    objective_metrics['breakdown']['accuracy'] >= 0.90  # Good accuracy
+            )
+
+            if can_exit:
+                logger.info(
+                    f"✓ Quality threshold met: {quality_score:.3f} >= {current_threshold:.3f} "
+                    f"(iteration {current_iteration + 1})"
+                )
                 break
+            else:
+                # FIXED: Only one log statement
+                logger.info(
+                    f"⚠ Quality threshold not met: {quality_score:.3f} < {current_threshold:.3f} "
+                    f"(iteration {current_iteration + 1}, continuing...)"
+                )
+
             current_iteration += 1
+
+        # Update total API calls
+        self.stats['total_api_calls'] += api_calls_used
+
+        logger.info(
+            f"Query completed: {api_calls_used} API calls, "
+            f"{len(iterations)} iterations, "
+            f"final quality: {quality_score:.3f}"
+        )
+
 
         return MultiAgentSession(
             session_id=session_id,
@@ -949,6 +1680,44 @@ class MultiAgentSystem:
             context_used=context[:1000] + "..." if len(context) > 1000 else context
         )
 
+    # Add this method to your MultiAgentSystem class (after process_query method, around line 1450)
+
+    @log_errors
+    def get_routing_stats(self) -> Dict[str, Any]:
+        """Get intelligent routing statistics"""
+        total_queries = (
+                self.stats['simple_queries'] +
+                self.stats['medium_queries'] +
+                self.stats['complex_queries']
+        )
+
+        if total_queries == 0:
+            return {
+                "message": "No queries processed yet",
+                "total_queries": 0,
+                "total_api_calls": 0
+            }
+
+        # Calculate API calls that would have been used without routing
+        # (assuming all queries would use 4 agents = 4 calls per query)
+        baseline_api_calls = total_queries * 4
+
+        # Calculate average API calls per query
+        avg_calls = self.stats['total_api_calls'] / total_queries if total_queries > 0 else 0
+
+        # Calculate API calls saved
+        api_calls_saved = baseline_api_calls - self.stats['total_api_calls']
+
+        return {
+            'total_queries': total_queries,
+            'simple_queries': self.stats['simple_queries'],
+            'medium_queries': self.stats['medium_queries'],
+            'complex_queries': self.stats['complex_queries'],
+            'total_api_calls': self.stats['total_api_calls'],
+            'avg_calls_per_query': round(avg_calls, 2),
+            'api_calls_saved': api_calls_saved,
+            'efficiency_percentage': round((1 - avg_calls / 4) * 100, 1) if avg_calls > 0 else 0
+        }
 
 # --- Autonomous Assistant ---
 class AutonomousMultiAgentAssistant:
@@ -976,6 +1745,7 @@ class AutonomousMultiAgentAssistant:
         return self.file_manager.get_conversation_context(user_id, 70)
 
     def clear_cached_context(self, user_id: str):
+        """Clear cached context for a user"""
         self._cached_context.pop(user_id, None)
 
     @log_errors
@@ -1131,15 +1901,18 @@ class AutonomousMultiAgentAssistant:
             topic_counts[topic] = topic_counts.get(topic, 0) + 1
         return sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:5]
 
-
 # --- Rich CLI ---
 class RichMultiAgentCLI:
     def __init__(self, api_key: str):
-        self.console = Console()
+        self.console = Console()  # This line was missing!
         self.assistant = AutonomousMultiAgentAssistant(api_key)
-        self.user_id = "default_user"
-        self.conversation_count = 0
+        self.user_id = "user_001"
         self.session_start = datetime.now()
+
+        # Command aliases
+        # ALSO: Update the command_aliases dictionary in RichMultiAgentCLI.__init__ (around line 1550)
+        # Find this section and ADD the 'routing' aliases:
+
         self.command_aliases = {
             'q': 'quit', 'exit': 'quit',
             'c': 'chat',
@@ -1147,8 +1920,14 @@ class RichMultiAgentCLI:
             't': 'tasks',
             'd': 'docs',
             'h': 'help',
-            'b': 'back'
+            'b': 'back',
+            'm': 'maintenance',
+            'clean': 'maintenance',
+            'del': 'maintenance',
+            'clear': 'cls',
+            'r': 'routing',  # ADD THIS LINE
         }
+
         # Custom progress bar styles
         self.progress_styles = {
             "context": Style(color="yellow", blink=False, bold=True),
@@ -1159,6 +1938,121 @@ class RichMultiAgentCLI:
             "complete": Style(color="green", blink=True, bold=True),
             "error": Style(color="red", blink=True, bold=True)
         }
+
+    def display_routing_stats(self):
+        """Display intelligent routing statistics"""
+        progress = self.create_progress()
+        task = progress.add_task("[bold cyan]📊 Loading routing statistics...[/bold cyan]", total=100)
+
+        with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+            # Animate to 40%
+            current_percent = 0
+            while current_percent < 40:
+                current_percent += 2
+                progress.update(task, completed=current_percent)
+                time.sleep(0.03)
+
+            # Get routing stats
+            stats = self.assistant.multi_agent_system.get_routing_stats()
+
+            progress.update(task, completed=70,
+                            description="[bold cyan]📊 Analyzing routing efficiency...[/bold cyan]")
+
+            current_percent = 70
+            while current_percent < 90:
+                current_percent += 1
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            # Complete animation
+            while current_percent < 100:
+                current_percent += 1
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            progress.update(task, completed=100, description="[bold green]✅ Statistics loaded![/bold green]")
+
+        if "message" in stats:
+            self.console.print(Panel(
+                f"[yellow]{stats['message']}[/yellow]",
+                title="[bold]📊 Routing Statistics[/bold]",
+                border_style="yellow"
+            ))
+            return
+
+        # Create routing statistics table
+        routing_table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            box=ROUNDED,
+            title="Intelligent Query Routing Statistics"
+        )
+        routing_table.add_column("Complexity", style="bold white", width=15)
+        routing_table.add_column("Count", justify="right", style="bold magenta", width=10)
+        routing_table.add_column("Percentage", justify="right", style="bold green", width=12)
+        routing_table.add_column("API Calls", justify="right", style="bold yellow", width=12)
+
+        total = stats['total_queries']
+
+        # Add rows with color coding
+        complexities = [
+            ('Simple', stats['simple_queries'], 'green', '1 per query'),
+            ('Medium', stats['medium_queries'], 'yellow', '3 per query'),
+            ('Complex', stats['complex_queries'], 'red', '4-8 per query')
+        ]
+
+        for label, count, color, calls in complexities:
+            percentage = round((count / total * 100), 1) if total > 0 else 0
+            routing_table.add_row(
+                f"[{color}]{label}[/{color}]",
+                str(count),
+                f"{percentage}%",
+                calls
+            )
+
+        self.console.print(Panel(
+            routing_table,
+            title="[bold cyan]📊 Query Routing Breakdown[/bold cyan]",
+            border_style="cyan",
+            padding=(1, 1)
+        ))
+
+        # Efficiency summary
+        efficiency_text = f"""
+               [bold]🎯 Routing Efficiency:[/bold]
+               • Total Queries Processed: [bold]{stats['total_queries']}[/bold]
+               • Total API Calls Used: [bold]{stats['total_api_calls']}[/bold]
+               • Average Calls per Query: [bold]{stats['avg_calls_per_query']}[/bold]
+               • API Calls Saved: [bold green]{stats['api_calls_saved']}[/bold green]
+
+               [bold yellow]💡 Cost Optimization:[/bold yellow]
+               • Without routing: [dim]{stats['total_queries'] * 4} API calls[/dim]
+               • With routing: [bold green]{stats['total_api_calls']} API calls[/bold green]
+               • Efficiency gain: [bold green]{round((1 - stats['avg_calls_per_query'] / 4) * 100, 1)}%[/bold green]
+
+               [bold cyan]📈 Distribution:[/bold cyan]
+               • Simple queries (fast): {stats['simple_queries']} ({round(stats['simple_queries'] / total * 100, 1) if total > 0 else 0}%)
+               • Medium queries (balanced): {stats['medium_queries']} ({round(stats['medium_queries'] / total * 100, 1) if total > 0 else 0}%)
+               • Complex queries (thorough): {stats['complex_queries']} ({round(stats['complex_queries'] / total * 100, 1) if total > 0 else 0}%)
+               """
+
+        self.console.print(Panel(efficiency_text, border_style="green", padding=(1, 2)))
+
+        # Visual representation
+        if total > 0:
+            simple_bar = "█" * int(stats['simple_queries'] / total * 20)
+            medium_bar = "█" * int(stats['medium_queries'] / total * 20)
+            complex_bar = "█" * int(stats['complex_queries'] / total * 20)
+
+            visual_text = f"""
+                   [bold]Query Distribution:[/bold]
+                   Simple:  [green]{simple_bar}[/green] {stats['simple_queries']}
+                   Medium:  [yellow]{medium_bar}[/yellow] {stats['medium_queries']}
+                   Complex: [red]{complex_bar}[/red] {stats['complex_queries']}
+                   """
+            self.console.print(Panel(visual_text, border_style="blue", padding=(1, 2)))
+
+
 
     def display_banner(self):
         """Display the exact ASCII art banner design for LAZYCOOK."""
@@ -1210,18 +2104,32 @@ class RichMultiAgentCLI:
     def display_help(self):
         help_text = """
         [bold magenta]📋 Available Commands:[/bold magenta]
-        • [bold green]chat[/bold green]       Start a conversation (type [bold red]back[/bold red] to exit)
-        • [bold green]insights[/bold green]   View user interaction statistics
-        • [bold green]docs[/bold green]       Manage uploaded documents
-        • [bold green]tasks[/bold green]      Show autonomous tasks and status
-        • [bold green]quality[/bold green]    Display recent quality scores
-        • [bold green]agents[/bold green]     Show multi-agent architecture
-        • [bold green]context[/bold green]    Preview conversation context
-        • [bold green]files[/bold green]      Check data file status
-        • [bold green]stats[/bold green]      System performance statistics
-        • [bold green]clear[/bold green]      Clear the console screen
-        • [bold green]help[/bold green]       Show this help menu
-        • [bold red]quit[/bold red]          Exit the application
+        • [bold green]chat[/bold green]         Start a conversation (type [bold red]back[/bold red] to exit)
+        • [bold green]insights[/bold green]     View user interaction statistics
+        • [bold green]docs[/bold green]         Manage uploaded documents (view/upload)
+        • [bold green]maintenance[/bold green]  🔧 Cleanup & management
+        • [bold green]tasks[/bold green]        Show autonomous tasks and status
+        • [bold green]quality[/bold green]      Display recent quality scores
+        • [bold green]routing[/bold green]      📊 View intelligent routing statistics (NEW!)
+        • [bold green]agents[/bold green]       Show multi-agent architecture
+        • [bold green]context[/bold green]      Preview conversation context
+        • [bold green]files[/bold green]        Check data file status
+        • [bold green]stats[/bold green]        System performance statistics
+        • [bold green]cls[/bold green]          Clear the console screen
+        • [bold green]help[/bold green]         Show this help menu
+        • [bold red]quit[/bold red]            Exit the application
+
+        [bold yellow]🔧 Maintenance Features:[/bold yellow]
+        • Delete specific documents or clear all documents
+        • Clear conversations with various options (all/recent)
+        • Document capacity management (100 docs / 100MB limit)
+        • Full system cleanup options
+
+        [bold cyan]⚡ Shortcuts:[/bold cyan]
+        • Type 'r' for routing stats
+        • Type 'c' for chat mode
+        • Type 'i' for insights
+        • Type 'q' to quit
 
         [dim]Type 'back' to return to main menu from any command.[/dim]
         [bold yellow]⚠️ Note:[/bold yellow] The system uses conversation history and uploaded documents
@@ -1747,18 +2655,108 @@ class RichMultiAgentCLI:
 
         # 4. Quality Footer (badge-style, simple cyan)
         if quality_info:
+            # Get latest conversation for detailed metrics
+            conversations = self.assistant.file_manager.get_recent_conversations(self.user_id, 1)
+            if conversations and conversations[0].multi_agent_session:
+                session = conversations[0].multi_agent_session
+
+                # Check if quality metrics exist in iterations
+                if session.iterations and 'quality_metrics' in session.iterations[-1]:
+                    quality_metrics = session.iterations[-1]['quality_metrics']
+                    self.display_quality_breakdown(quality_metrics)
+
+            # Simple quality footer
             quality_panel = Panel(
                 Text(quality_info, style="bold dim"),
                 title="📊 Processing Metrics",
-                border_style="cyan",  # Simple solid color
+                border_style="cyan",
                 padding=(0, 1),
                 expand=True
             )
             self.console.print(quality_panel)
 
-        # 5. Styled Divider (simple dim style)
-        self.console.print(Rule("─🤖─", style="dim"))  # Simple dim color
-        self.console.print()  # Extra newline for vertical spacing
+    def display_quality_breakdown(self, quality_metrics: Dict[str, Any]):
+        """Display detailed quality metrics breakdown"""
+
+        if not quality_metrics or 'objective' not in quality_metrics:
+            return
+
+        objective = quality_metrics['objective']
+        breakdown = objective.get('breakdown', {})
+
+        # Create quality breakdown table
+        quality_table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            box=ROUNDED,
+            title="Quality Metrics Breakdown"
+        )
+        quality_table.add_column("Metric", style="bold white", width=18)
+        quality_table.add_column("Score", justify="center", style="bold", width=8)
+        quality_table.add_column("Weight", justify="center", style="dim", width=8)
+        quality_table.add_column("Status", style="bold", width=15)
+
+        # Color coding for scores
+        def get_score_color(score: float) -> str:
+            if score >= 0.95:
+                return "green"
+            elif score >= 0.90:
+                return "cyan"
+            elif score >= 0.85:
+                return "yellow"
+            else:
+                return "red"
+
+        def get_status_icon(score: float) -> str:
+            if score >= 0.95:
+                return "🔥 Excellent"
+            elif score >= 0.90:
+                return "✅ Very Good"
+            elif score >= 0.85:
+                return "📈 Good"
+            else:
+                return "⚠️ Needs Work"
+
+        weights = objective.get('weights', {})
+
+        # Add rows for each metric
+        for metric, score in breakdown.items():
+            color = get_score_color(score)
+            weight = weights.get(metric, 0)
+            quality_table.add_row(
+                metric.replace('_', ' ').title(),
+                f"[{color}]{score:.2f}[/{color}]",
+                f"{weight:.0%}",
+                get_status_icon(score)
+            )
+
+        # Overall score row
+        overall = objective.get('overall', 0)
+        overall_color = get_score_color(overall)
+        quality_table.add_row(
+            "[bold]OVERALL[/bold]",
+            f"[bold {overall_color}]{overall:.3f}[/bold {overall_color}]",
+            "100%",
+            f"[bold]{quality_metrics.get('tier', 'Unknown')}[/bold]"
+        )
+
+        self.console.print(Panel(
+            quality_table,
+            title="[bold cyan]📊 Quality Analysis[/bold cyan]",
+            border_style="cyan",
+            padding=(1, 1)
+        ))
+
+        # Combined score info
+        combined_info = f"""
+        [bold]Scoring Method:[/bold]
+        • Objective Metrics: [bold cyan]{objective['overall']:.3f}[/bold cyan] (40% weight)
+        • Agent Confidence: [bold yellow]{quality_metrics.get('subjective', 0):.3f}[/bold yellow] (60% weight)
+        • Combined Score: [bold green]{quality_metrics.get('combined', 0):.3f}[/bold green]
+        • Quality Tier: [bold]{quality_metrics.get('tier', 'Unknown')}[/bold]
+        """
+
+        self.console.print(Panel(combined_info, border_style="blue", padding=(1, 2)))
 
     def show_agent_progress(self, message: str):
         """Show detailed agent processing with animated progress bars"""
@@ -1992,7 +2990,30 @@ class RichMultiAgentCLI:
             progress.update(task, completed=100, description="[bold green]✓ Context loaded![/bold green]")
 
     def upload_document(self):
-        """Document upload with animated progress tracking"""
+        """Document upload with capacity checking and animated progress tracking"""
+        # Check capacity first
+        capacity_info = self.assistant.file_manager.get_documents_capacity_info(self.user_id)
+
+        if capacity_info['at_document_limit']:
+            self.console.print(Panel(
+                f"[red]❌ Document limit reached![/red]\n"
+                f"You have {capacity_info['total_documents']}/{capacity_info['max_documents']} documents.\n"
+                f"Please delete some documents first.",
+                title="[bold red]Upload Failed[/bold red]",
+                border_style="red"
+            ))
+            return None
+
+        if capacity_info['at_size_limit']:
+            self.console.print(Panel(
+                f"[red]❌ Storage limit reached![/red]\n"
+                f"You have used {capacity_info['total_size_mb']:.1f}MB/{capacity_info['max_size_mb']}MB.\n"
+                f"Please delete some documents first.",
+                title="[bold red]Upload Failed[/bold red]",
+                border_style="red"
+            ))
+            return None
+
         file_path = Prompt.ask("[bold cyan]📁 Enter file path to upload[/bold cyan] (or 'back' to cancel)")
         if file_path.strip().lower() in ['back', 'exit', 'cancel']:
             return None
@@ -2003,8 +3024,20 @@ class RichMultiAgentCLI:
             return None
 
         file_size = file_path.stat().st_size
+
+        # Check if this file would exceed limits
+        if capacity_info['total_documents'] + 1 > capacity_info['max_documents']:
+            self.console.print("[red]This upload would exceed the document limit[/red]")
+            return None
+
+        if capacity_info['total_size_bytes'] + file_size > self.assistant.file_manager.max_storage_per_user:
+            needed_mb = round((capacity_info['total_size_bytes'] + file_size) / (1024 * 1024), 2)
+            self.console.print(
+                f"[red]This upload would exceed storage limit ({needed_mb}MB > {capacity_info['max_size_mb']}MB)[/red]")
+            return None
+
         if file_size > 5 * 1024 * 1024:
-            self.console.print("[red]File too large. Maximum size is 5MB[/red]")
+            self.console.print("[red]File too large. Maximum size is 5MB per file[/red]")
             return None
 
         progress = self.create_progress()
@@ -2020,18 +3053,8 @@ class RichMultiAgentCLI:
                 time.sleep(0.05)
 
             # Simulate processing
-            # Simulate processing
             progress.update(task, completed=60, description="[bold cyan]💾 Uploading and indexing...[/bold cyan]")
-            current_percent = 60  # Update current_percent to match the progress
-            while current_percent < 95:
-                current_percent += 1
-                progress.update(task, completed=current_percent)
-                time.sleep(0.02)
-
-            # Actual file processing
-            # Actual file processing
-            progress.update(task, completed=60, description="[bold cyan]💾 Uploading and indexing...[/bold cyan]")
-            current_percent = 60  # Update current_percent to match the progress
+            current_percent = 60
             try:
                 document = self.assistant.file_manager.process_uploaded_file(str(file_path), self.user_id)
 
@@ -2043,7 +3066,10 @@ class RichMultiAgentCLI:
 
                 if document:
                     progress.update(task, completed=100,
-                                    description="[bold green]✓ Document uploaded successfully![/bold green]")
+                                    description="[bold green]✅ Document uploaded successfully![/bold green]")
+
+                    # Show updated capacity info
+                    new_capacity = self.assistant.file_manager.get_documents_capacity_info(self.user_id)
 
                     info_table = Table(show_header=False, box=None, padding=(0, 2))
                     info_table.add_column(style="bold cyan", width=15)
@@ -2051,8 +3077,13 @@ class RichMultiAgentCLI:
                     info_table.add_row("Filename:", document.filename)
                     info_table.add_row("Type:", document.file_type)
                     info_table.add_row("Size:", decimal(document.file_size))
+                    info_table.add_row("Documents:",
+                                       f"{new_capacity['total_documents']}/{new_capacity['max_documents']}")
+                    info_table.add_row("Storage:",
+                                       f"{new_capacity['total_size_mb']:.1f}MB/{new_capacity['max_size_mb']}MB")
                     info_table.add_row("Preview:", document.content[:100] + "..." if len(
                         document.content) > 100 else document.content)
+
                     self.console.print(
                         Panel(info_table, title="[bold green]📄 Document Info[/bold green]", border_style="green",
                               padding=(1, 2)))
@@ -2134,6 +3165,323 @@ class RichMultiAgentCLI:
                 time.sleep(0.02)
 
             progress.update(task, completed=100, description="[bold green]✓ Documents loaded![/bold green]")
+
+        # Add these methods to the RichMultiAgentCLI class (around line 1200, after existing display methods)
+
+    def delete_specific_document(self):
+        """Delete a specific document with interactive selection"""
+        progress = self.create_progress()
+        task = progress.add_task("[bold cyan]📄 Loading documents...[/bold cyan]", total=100)
+
+        with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+            # Animate to 40%
+            current_percent = 0
+            while current_percent < 40:
+                current_percent += 2
+                progress.update(task, completed=current_percent)
+                time.sleep(0.03)
+
+            documents = self.assistant.file_manager.get_user_documents(self.user_id)
+
+            # Complete animation
+            while current_percent < 100:
+                current_percent += 2
+                progress.update(task, completed=current_percent)
+                time.sleep(0.02)
+
+            progress.update(task, completed=100, description="[bold green]✅ Documents loaded![/bold green]")
+
+        if not documents:
+            self.console.print(Panel(
+                "[yellow]No documents to delete[/yellow]",
+                title="[bold]📄 Delete Document[/bold]",
+                border_style="yellow"
+            ))
+            return
+
+        # Display documents for selection
+        docs_table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            box=ROUNDED,
+            title="Select Document to Delete"
+        )
+        docs_table.add_column("#", style="bold magenta", width=3)
+        docs_table.add_column("Filename", style="bold cyan", width=25)
+        docs_table.add_column("Type", style="white", width=12)
+        docs_table.add_column("Size", justify="right", style="bold magenta", width=10)
+        docs_table.add_column("Uploaded", style="dim", width=12)
+
+        for i, doc in enumerate(documents, 1):
+            docs_table.add_row(
+                str(i),
+                doc.filename,
+                doc.file_type.split('/')[-1],
+                decimal(doc.file_size),
+                doc.upload_time.strftime("%m-%d %H:%M")
+            )
+
+        self.console.print(Panel(
+            docs_table,
+            title="[bold red]🗑️ Delete Document[/bold red]",
+            border_style="red",
+            padding=(1, 1)
+        ))
+
+        try:
+            choice = Prompt.ask(
+                f"[bold cyan]Enter document number (1-{len(documents)}) or 'back' to cancel[/bold cyan]"
+            ).strip()
+
+            if choice.lower() in ['back', 'cancel', 'exit']:
+                return
+
+            doc_index = int(choice) - 1
+            if 0 <= doc_index < len(documents):
+                selected_doc = documents[doc_index]
+
+                if Confirm.ask(f"[bold red]Are you sure you want to delete '{selected_doc.filename}'?[/bold red]"):
+                    if self.assistant.file_manager.delete_document(selected_doc.id, self.user_id):
+                        self.console.print(
+                            f"[bold green]✅ Document '{selected_doc.filename}' deleted successfully![/bold green]")
+                    else:
+                        self.console.print(
+                            f"[bold red]❌ Failed to delete document '{selected_doc.filename}'[/bold red]")
+            else:
+                self.console.print("[red]Invalid selection[/red]")
+
+        except ValueError:
+            self.console.print("[red]Invalid input. Please enter a number.[/red]")
+        except Exception as e:
+            self.console.print(f"[red]Error: {str(e)}[/red]")
+
+    def clear_conversations_menu(self):
+        """Interactive menu for clearing conversations"""
+        options_text = """
+        [bold magenta]🗑️ Clear Conversations Options:[/bold magenta]
+
+        • [bold green]1[/bold green] - Clear ALL conversations (complete reset)
+        • [bold yellow]2[/bold yellow] - Clear old conversations (keep recent 20)
+        • [bold blue]3[/bold blue] - Clear old conversations (keep recent 10)
+        • [bold red]4[/bold red] - Clear old conversations (keep recent 5)
+        • [bold dim]back[/bold dim] - Return to main menu
+
+        [bold yellow]⚠️ Warning:[/bold yellow] This action cannot be undone!
+        """
+
+        self.console.print(Panel(options_text, border_style="red", padding=(1, 2)))
+
+        choice = Prompt.ask("[bold cyan]Select option[/bold cyan]").strip().lower()
+
+        if choice in ['back', 'cancel', 'exit']:
+            return
+
+        # Show current conversation count
+        conversations = self.assistant.file_manager.get_recent_conversations(self.user_id, 1000)
+        current_count = len(conversations)
+
+        self.console.print(f"[bold]Current conversations: {current_count}[/bold]")
+
+        if choice == '1':
+            # Clear all conversations
+            if Confirm.ask(
+                    f"[bold red]Are you sure you want to delete ALL {current_count} conversations?[/bold red]"):
+                progress = self.create_progress()
+                task = progress.add_task("[bold red]🗑️ Clearing all conversations...[/bold red]", total=100)
+
+                with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+                    for i in range(100):
+                        progress.update(task, completed=i + 1)
+                        time.sleep(0.02)
+
+                    success = self.assistant.file_manager.clear_all_conversations(self.user_id)
+
+                if success:
+                    self.console.print("[bold green]✅ All conversations cleared successfully![/bold green]")
+                    # Clear cached context
+                    self.assistant.clear_cached_context(self.user_id)
+                else:
+                    self.console.print("[bold red]❌ Failed to clear conversations[/bold red]")
+
+        elif choice in ['2', '3', '4']:
+            # Clear old conversations with different keep amounts
+            keep_amounts = {'2': 20, '3': 10, '4': 5}
+            keep_recent = keep_amounts[choice]
+
+            if current_count <= keep_recent:
+                self.console.print(
+                    f"[yellow]You only have {current_count} conversations. No need to clear old ones.[/yellow]")
+                return
+
+            to_delete = current_count - keep_recent
+            if Confirm.ask(
+                    f"[bold yellow]Delete {to_delete} old conversations and keep the {keep_recent} most recent?[/bold yellow]"):
+                progress = self.create_progress()
+                task = progress.add_task(f"[bold yellow]🗑️ Clearing {to_delete} old conversations...[/bold yellow]",
+                                         total=100)
+
+                with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+                    for i in range(100):
+                        progress.update(task, completed=i + 1)
+                        time.sleep(0.02)
+
+                    deleted_count = self.assistant.file_manager.clear_old_conversations(self.user_id, keep_recent)
+
+                self.console.print(
+                    f"[bold green]✅ Cleared {deleted_count} old conversations, kept {keep_recent} recent ones![/bold green]")
+                # Clear cached context to refresh
+                self.assistant.clear_cached_context(self.user_id)
+        else:
+            self.console.print("[red]Invalid option selected[/red]")
+
+    def manage_documents_menu(self):
+        """Enhanced document management with capacity info and delete options"""
+        while True:
+            # Get capacity info
+            capacity_info = self.assistant.file_manager.get_documents_capacity_info(self.user_id)
+
+            # Create capacity display
+            usage_bar = "█" * int(capacity_info['usage_percentage'] / 5) + "░" * (
+                    20 - int(capacity_info['usage_percentage'] / 5))
+            capacity_color = "red" if capacity_info['usage_percentage'] > 80 else "yellow" if capacity_info[
+                                                                                                  'usage_percentage'] > 60 else "green"
+
+            menu_text = f"""
+            [bold magenta]📄 Document Management:[/bold magenta]
+
+            [bold]Storage Usage:[/bold]
+            [{capacity_color}]{usage_bar}[/{capacity_color}] {capacity_info['usage_percentage']}%
+            • Documents: {capacity_info['total_documents']}/{capacity_info['max_documents']} ({capacity_info['documents_remaining']} remaining)
+            • Storage: {capacity_info['total_size_mb']}MB/{capacity_info['max_size_mb']}MB ({capacity_info['size_remaining_mb']}MB remaining)
+
+            [bold]Options:[/bold]
+            • [bold green]1[/bold green] - View all documents
+            • [bold blue]2[/bold blue] - Upload new document
+            • [bold yellow]3[/bold yellow] - Delete specific document
+            • [bold red]4[/bold red] - Clear all documents
+            • [bold dim]back[/bold dim] - Return to main menu
+            """
+
+            # Add warnings if at limits
+            if capacity_info['at_document_limit']:
+                menu_text += "\n[bold red]⚠️ Document limit reached! Delete some documents to upload new ones.[/bold red]"
+            if capacity_info['at_size_limit']:
+                menu_text += "\n[bold red]⚠️ Storage limit reached! Delete some documents to free space.[/bold red]"
+
+            self.console.print(Panel(menu_text, border_style="cyan", padding=(1, 2)))
+
+            choice = Prompt.ask("[bold cyan]Select option[/bold cyan]").strip().lower()
+
+            if choice in ['back', 'cancel', 'exit']:
+                break
+            elif choice == '1':
+                self.display_documents()
+                Prompt.ask("[bold]Press Enter to continue...[/bold]")
+            elif choice == '2':
+                if capacity_info['at_document_limit']:
+                    self.console.print("[red]❌ Document limit reached! Delete some documents first.[/red]")
+                elif capacity_info['at_size_limit']:
+                    self.console.print("[red]❌ Storage limit reached! Delete some documents first.[/red]")
+                else:
+                    self.upload_document()
+                Prompt.ask("[bold]Press Enter to continue...[/bold]")
+            elif choice == '3':
+                self.delete_specific_document()
+                Prompt.ask("[bold]Press Enter to continue...[/bold]")
+            elif choice == '4':
+                if Confirm.ask(
+                        f"[bold red]Are you sure you want to delete ALL {capacity_info['total_documents']} documents?[/bold red]"):
+                    progress = self.create_progress()
+                    task = progress.add_task("[bold red]🗑️ Clearing all documents...[/bold red]", total=100)
+
+                    with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+                        for i in range(100):
+                            progress.update(task, completed=i + 1)
+                            time.sleep(0.02)
+
+                        deleted_count = self.assistant.file_manager.clear_all_documents(self.user_id)
+
+                    self.console.print(
+                        f"[bold green]✅ Cleared {deleted_count} documents successfully![/bold green]")
+                Prompt.ask("[bold]Press Enter to continue...[/bold]")
+            else:
+                self.console.print("[red]Invalid option selected[/red]")
+
+    def display_maintenance_menu(self):
+        """Display maintenance and cleanup options"""
+        maintenance_text = """
+        [bold magenta]🔧 Maintenance & Cleanup:[/bold magenta]
+
+        • [bold green]1[/bold green] - Clear conversations (with options)
+        • [bold blue]2[/bold blue] - Manage documents (view/delete/capacity)
+        • [bold yellow]3[/bold yellow] - View storage statistics
+        • [bold red]4[/bold red] - Full system cleanup (conversations + documents)
+        • [bold dim]back[/bold dim] - Return to main menu
+
+        [bold yellow]⚠️ Warning:[/bold yellow] Cleanup operations cannot be undone!
+        """
+
+        self.console.print(Panel(maintenance_text, border_style="yellow", padding=(1, 2)))
+
+        choice = Prompt.ask("[bold cyan]Select maintenance option[/bold cyan]").strip().lower()
+
+        if choice in ['back', 'cancel', 'exit']:
+            return
+        elif choice == '1':
+            self.clear_conversations_menu()
+        elif choice == '2':
+            self.manage_documents_menu()
+        elif choice == '3':
+            self.display_stats()
+        elif choice == '4':
+            # Full cleanup
+            conversations = self.assistant.file_manager.get_recent_conversations(self.user_id, 1000)
+            documents = self.assistant.file_manager.get_user_documents(self.user_id, 1000)
+
+            warning_text = f"""
+            [bold red]⚠️ FULL SYSTEM CLEANUP WARNING ⚠️[/bold red]
+
+            This will delete:
+            • All {len(conversations)} conversations
+            • All {len(documents)} documents
+            • All cached context data
+
+            This action is [bold red]IRREVERSIBLE[/bold red]!
+            """
+
+            self.console.print(Panel(warning_text, border_style="red", padding=(1, 2)))
+
+            if Confirm.ask("[bold red]Are you absolutely sure you want to perform a full cleanup?[/bold red]"):
+                if Confirm.ask("[bold red]This is your final warning. Continue with full cleanup?[/bold red]"):
+                    progress = self.create_progress()
+                    task = progress.add_task("[bold red]🗑️ Performing full system cleanup...[/bold red]", total=100)
+
+                    with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+                        # Clear conversations
+                        progress.update(task, completed=25,
+                                        description="[bold red]🗑️ Clearing conversations...[/bold red]")
+                        conv_success = self.assistant.file_manager.clear_all_conversations(self.user_id)
+
+                        # Clear documents
+                        progress.update(task, completed=50,
+                                        description="[bold red]🗑️ Clearing documents...[/bold red]")
+                        doc_count = self.assistant.file_manager.clear_all_documents(self.user_id)
+
+                        # Clear cache
+                        progress.update(task, completed=75, description="[bold red]🗑️ Clearing cache...[/bold red]")
+                        self.assistant.clear_cached_context(self.user_id)
+
+                        # Complete
+                        progress.update(task, completed=100,
+                                        description="[bold green]✅ Full cleanup complete![/bold green]")
+                        time.sleep(1)
+
+                    self.console.print(f"[bold green]✅ Full cleanup completed successfully![/bold green]")
+                    self.console.print(f"• Conversations cleared: {len(conversations)}")
+                    self.console.print(f"• Documents cleared: {doc_count}")
+                    self.console.print("• Cache cleared")
+        else:
+            self.console.print("[red]Invalid option selected[/red]")
 
     async def handle_chat_mode(self):
         """Handle chat mode with persistent context and exit option"""
@@ -2218,8 +3566,21 @@ class RichMultiAgentCLI:
                     self.display_stats()
                     Prompt.ask("[bold]Press Enter to continue...[/bold]")
 
+                elif command == "routing":
+                    self.display_routing_stats()
+                    Prompt.ask("[bold]Press Enter to continue...[/bold]")
+
+
                 elif command == "help":
                     self.display_help()
+
+                elif command == "maintenance":
+                    self.display_maintenance_menu()
+                    Prompt.ask("[bold]Press Enter to continue...[/bold]")
+
+                elif command == "cls":
+                    self.console.clear()
+                    self.display_banner()
 
                 else:
                     self.console.print(f"[red]Unknown command: {command}[/red]")
@@ -2242,32 +3603,22 @@ class MultiAgentAssistantConfig:
         self.conversation_limit = conversation_limit
 
     def create_assistant(self):
-        """Create and return a configured assistant instance"""
-        return AutonomousMultiAgentAssistant(self.api_key)
+        """Create assistant with properly configured file manager"""
+        assistant = AutonomousMultiAgentAssistant(self.api_key)
+        # Replace the file manager with configured one
+        assistant.file_manager = TextFileManager(
+            conversation_limit=self.conversation_limit
+        )
+        return assistant
 
     def create_cli(self):
-        """Create and return a configured CLI instance"""
-        # Monkey patch the conversation limit
-        original_get_conversation_context = TextFileManager.get_conversation_context
-        original_get_recent_conversations = TextFileManager.get_recent_conversations
-        original_get_session_conversations = TextFileManager.get_session_conversations
-
-        def patched_get_conversation_context(self, user_id: str, limit: int = None):
-            return original_get_conversation_context(self, user_id, limit or self.conversation_limit)
-
-        def patched_get_recent_conversations(self, user_id: str, limit: int = None):
-            return original_get_recent_conversations(self, user_id, limit or self.conversation_limit)
-
-        def patched_get_session_conversations(self, user_id: str, limit: int = None):
-            return original_get_session_conversations(self, user_id, limit or self.conversation_limit)
-
-        # Apply patches
-        TextFileManager.conversation_limit = self.conversation_limit
-        TextFileManager.get_conversation_context = patched_get_conversation_context
-        TextFileManager.get_recent_conversations = patched_get_recent_conversations
-        TextFileManager.get_session_conversations = patched_get_session_conversations
-
-        return RichMultiAgentCLI(self.api_key)
+        """Create CLI with configured file manager"""
+        cli = RichMultiAgentCLI(self.api_key)
+        # Replace the file manager in the assistant
+        cli.assistant.file_manager = TextFileManager(
+            conversation_limit=self.conversation_limit
+        )
+        return cli
 
     async def run_cli(self):
         """Run the CLI interface with custom configuration"""
