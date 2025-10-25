@@ -940,15 +940,76 @@ class AIAgent:
             confidence -= 0.05
             improvements.append("Could benefit from formatting")
 
-        return AgentResponse(
-            agent_role=self.role,
-            content=f"Analysis complete. Word count: {word_count}",
-            confidence=confidence,
-            suggestions=improvements,
-            errors_found=errors_found,
-            improvements=improvements,
-            metadata={"word_count": word_count, "deterministic": True}
-        )
+
+
+        prompt = f"""
+                Role: Critical Analyzer Agent
+                Task: Analyze the provided solution for errors, gaps, and improvements, considering conversation history.
+
+                {context}
+
+                Original User Query: {user_query}
+
+                Solution to Analyze:
+                {solution}
+
+                Instructions:
+                1. Review the conversation history to understand the full context
+                2. Check if the solution properly addresses the user's query in context of previous conversations
+                3. Identify factual errors or inaccuracies
+                4. Find logical inconsistencies
+                5. Spot missing information or gaps
+                6. Check if the solution maintains conversational continuity
+                7. Verify if previous relevant information was properly considered
+                8. Suggest areas for improvement
+                9. Rate the overall quality (0-1)
+                10. Be thorough but constructive
+
+                Format your response as JSON:
+                {{
+                    "analysis": "Your detailed analysis",
+                    "errors_found": ["error1", "error2"],
+                    "gaps_identified": ["gap1", "gap2"],
+                    "improvements_needed": ["improvement1", "improvement2"],
+                    "quality_score": 0.75,
+                    "strengths": ["strength1", "strength2"],
+                    "recommendations": ["rec1", "rec2"],
+                    "context_adherence": 0.8,
+                    "continuity_score": 0.7
+                }}
+                """
+
+        try:
+            response = await self.model.generate_content_async(prompt)
+            response_text = response.text.strip()
+
+            if response_text.startswith('```json'):
+                response_text = response_text[7:-3]
+            elif response_text.startswith('```'):
+                response_text = response_text[3:-3]
+
+            data = json.loads(response_text)
+
+            return AgentResponse(
+                agent_role=self.role,
+                content=data.get("analysis", response_text),
+                confidence=data.get("quality_score", 0.7),
+                suggestions=data.get("recommendations", []),
+                errors_found=data.get("errors_found", []),
+                improvements=data.get("improvements_needed", []),
+                metadata=data
+            )
+        except Exception as e:
+            logger.error(f"Analyzer agent error: {e}")
+            return AgentResponse(
+                agent_role=self.role,
+                content="Analysis completed with some limitations.",
+                confidence=0.6,
+                suggestions=[],
+                errors_found=[],
+                improvements=[],
+                metadata={"error": str(e)}
+            )
 
     @log_errors
     async def _optimize_solution(self, user_query: str, context: str, previous_iteration: Dict) -> AgentResponse:
