@@ -840,6 +840,102 @@ class TextFileManager:
             logger.error(f"Failed to clear old conversations: {e}")
             return 0
 
+    @log_errors
+    def export_conversations_to_file(self, user_id: str, format: str = "txt", limit: int = None) -> Optional[str]:
+        """Export conversations to a downloadable file"""
+        try:
+            limit = self._get_effective_limit(limit)
+            conversations = self.get_recent_conversations(user_id, limit)
+
+            if not conversations:
+                return None
+
+            # Sort oldest to newest for reading flow
+            conversations.sort(key=lambda x: x.timestamp)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"chat_export_{user_id}_{timestamp}.{format}"
+            filepath = self.data_dir / filename
+
+            if format == "txt":
+                content = self._format_txt_export(conversations)
+            elif format == "md":
+                content = self._format_markdown_export(conversations)
+            elif format == "json":
+                content = self._format_json_export(conversations)
+            else:
+                return None
+
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(content)
+
+            logger.info(f"Exported {len(conversations)} conversations to {filename}")
+            return str(filepath)
+
+        except Exception as e:
+            logger.error(f"Export failed: {e}")
+            return None
+
+    def _format_txt_export(self, conversations: List[Conversation]) -> str:
+        """Format conversations as plain text"""
+        lines = []
+        lines.append("=" * 80)
+        lines.append("LAZYCOOK CHAT EXPORT")
+        lines.append(f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"Total Conversations: {len(conversations)}")
+        lines.append("=" * 80)
+        lines.append("")
+
+        for i, conv in enumerate(conversations, 1):
+            lines.append(f"\n{'=' * 80}")
+            lines.append(f"CONVERSATION #{i}")
+            lines.append(f"Date: {conv.timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+            lines.append(f"{'=' * 80}")
+            lines.append(f"\nUSER:\n{conv.user_message}")
+            lines.append(f"\nASSISTANT:\n{conv.ai_response}")
+
+            if conv.multi_agent_session:
+                lines.append(f"\n[Quality Score: {conv.multi_agent_session.quality_score:.2f}]")
+                lines.append(f"[Iterations: {conv.multi_agent_session.total_iterations}]")
+
+            lines.append("")
+
+        return "\n".join(lines)
+
+    def _format_markdown_export(self, conversations: List[Conversation]) -> str:
+        """Format conversations as Markdown"""
+        lines = []
+        lines.append("# 🔥 LAZYCOOK Chat Export")
+        lines.append(f"\n**Exported:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"**Total Conversations:** {len(conversations)}")
+        lines.append("\n---\n")
+
+        for i, conv in enumerate(conversations, 1):
+            lines.append(f"\n## 💬 Conversation #{i}")
+            lines.append(f"**Date:** {conv.timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+            lines.append(f"\n### 👤 User:\n{conv.user_message}")
+            lines.append(f"\n### 🤖 Assistant:\n{conv.ai_response}")
+
+            if conv.multi_agent_session:
+                lines.append(
+                    f"\n*Quality: {conv.multi_agent_session.quality_score:.2f} | Iterations: {conv.multi_agent_session.total_iterations}*")
+
+            lines.append("\n---\n")
+
+        return "\n".join(lines)
+
+    def _format_json_export(self, conversations: List[Conversation]) -> str:
+        """Format conversations as JSON"""
+        export_data = {
+            "export_info": {
+                "exported_at": datetime.now().isoformat(),
+                "total_conversations": len(conversations),
+                "format_version": "1.0"
+            },
+            "conversations": [conv.to_dict() for conv in conversations]
+        }
+        return json.dumps(export_data, indent=2, ensure_ascii=False)
+
 # --- AI Agent ---
 class AIAgent:
     def __init__(self, api_key: str, role: AgentRole, temperature: float = 0.7):
@@ -981,12 +1077,21 @@ class AIAgent:
 
         try:
             response = await self.model.generate_content_async(prompt)
+            # AFTER - More robust extraction
             response_text = response.text.strip()
 
-            if response_text.startswith('```json'):
-                response_text = response_text[7:-3]
-            elif response_text.startswith('```'):
-                response_text = response_text[3:-3]
+            # Handle code blocks more reliably
+            if '```json' in response_text:
+                start_idx = response_text.find('```json') + 7
+                end_idx = response_text.rfind('```')
+                if end_idx > start_idx:
+                    response_text = response_text[start_idx:end_idx].strip()
+            elif '```' in response_text:
+                # Handle generic code blocks
+                start_idx = response_text.find('```') + 3
+                end_idx = response_text.rfind('```')
+                if end_idx > start_idx:
+                    response_text = response_text[start_idx:end_idx].strip()
 
             data = json.loads(response_text)
 
@@ -1980,6 +2085,9 @@ class RichMultiAgentCLI:
             'i': 'insights',
             't': 'tasks',
             'd': 'docs',
+            'dl': 'download',  # ADD THIS
+            'save': 'download',  # ADD THIS
+            'export': 'download',  # ADD THIS
             'h': 'help',
             'b': 'back',
             'm': 'maintenance',
@@ -2165,6 +2273,9 @@ class RichMultiAgentCLI:
     def display_help(self):
         help_text = """
         [bold magenta]📋 Available Commands:[/bold magenta]
+        • [bold green]chat[/bold green]         Start a conversation
+        • [bold green]download[/bold green]     💾 Download chat history (NEW!)
+        • [bold green]insights[/bold green]     View user interaction statistics
         • [bold green]chat[/bold green]         Start a conversation (type [bold red]back[/bold red] to exit)
         • [bold green]insights[/bold green]     View user interaction statistics
         • [bold green]docs[/bold green]         Manage uploaded documents (view/upload)
@@ -3544,6 +3655,304 @@ class RichMultiAgentCLI:
         else:
             self.console.print("[red]Invalid option selected[/red]")
 
+    def download_chat_menu(self):
+        """Main download menu with all options"""
+        menu_text = """
+        [bold magenta]💾 Download Chat History:[/bold magenta]
+
+        • [bold green]1[/bold green] - Save current chat only
+        • [bold blue]2[/bold blue] - Select specific chats to download
+        • [bold yellow]3[/bold yellow] - Download all chats (bulk export)
+        • [bold cyan]4[/bold cyan] - Download last N chats (10/20/50)
+        • [bold dim]back[/bold dim] - Cancel
+        """
+
+        self.console.print(Panel(menu_text, border_style="cyan", padding=(1, 2)))
+
+        choice = Prompt.ask("[bold cyan]Select option (1-4)[/bold cyan]").strip()
+
+        if choice.lower() in ['back', 'cancel', 'exit']:
+            return
+
+        if choice == '1':
+            self.download_current_chat()
+        elif choice == '2':
+            self.download_selected_chats()
+        elif choice == '3':
+            # Existing bulk download logic
+            self._bulk_download_all()
+        elif choice == '4':
+            # Existing limited download logic
+            self._bulk_download_limited()
+        else:
+            self.console.print("[red]Invalid option[/red]")
+
+    def _bulk_download_all(self):
+        """Download all conversations"""
+        format_choice = Prompt.ask("[bold cyan]Format? (1=txt, 2=md, 3=json)[/bold cyan]").strip()
+        format_map = {'1': 'txt', '2': 'md', '3': 'json'}
+        export_format = format_map.get(format_choice, 'txt')
+
+        progress = self.create_progress()
+        task = progress.add_task("[bold cyan]💾 Exporting all chats...[/bold cyan]", total=100)
+
+        with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+            for i in range(0, 100, 5):
+                progress.update(task, completed=i)
+                time.sleep(0.03)
+
+            filepath = self.assistant.file_manager.export_conversations_to_file(
+                self.user_id,
+                format=export_format,
+                limit=None  # All conversations
+            )
+
+            progress.update(task, completed=100, description="[bold green]✅ Complete![/bold green]")
+
+        if filepath:
+            file_size = Path(filepath).stat().st_size
+            self.console.print(Panel(
+                f"[bold green]✅ Exported all chats![/bold green]\n"
+                f"📁 {Path(filepath).name}\n"
+                f"📏 {decimal(file_size)}",
+                border_style="green"
+            ))
+
+    def _bulk_download_limited(self):
+        """Download limited number of conversations"""
+        scope_choice = Prompt.ask("[bold cyan]How many? (a=10, b=20, c=50)[/bold cyan]").strip().lower()
+        scope_map = {'a': 10, 'b': 20, 'c': 50}
+        limit = scope_map.get(scope_choice, 20)
+
+        format_choice = Prompt.ask("[bold cyan]Format? (1=txt, 2=md, 3=json)[/bold cyan]").strip()
+        format_map = {'1': 'txt', '2': 'md', '3': 'json'}
+        export_format = format_map.get(format_choice, 'txt')
+
+        progress = self.create_progress()
+        task = progress.add_task(f"[bold cyan]💾 Exporting last {limit} chats...[/bold cyan]", total=100)
+
+        with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+            for i in range(0, 100, 5):
+                progress.update(task, completed=i)
+                time.sleep(0.03)
+
+            filepath = self.assistant.file_manager.export_conversations_to_file(
+                self.user_id,
+                format=export_format,
+                limit=limit
+            )
+
+            progress.update(task, completed=100, description="[bold green]✅ Complete![/bold green]")
+
+        if filepath:
+            file_size = Path(filepath).stat().st_size
+            self.console.print(Panel(
+                f"[bold green]✅ Exported last {limit} chats![/bold green]\n"
+                f"📁 {Path(filepath).name}\n"
+                f"📏 {decimal(file_size)}",
+                border_style="green"
+            ))
+
+    def download_current_chat(self):
+        """Download only the current/latest conversation"""
+        menu_text = """
+        [bold magenta]💾 Download Current Chat:[/bold magenta]
+
+        Choose format:
+        • [bold green]1[/bold green] - Plain Text (.txt)
+        • [bold blue]2[/bold blue] - Markdown (.md)
+        • [bold yellow]3[/bold yellow] - JSON (.json)
+        • [bold dim]back[/bold dim] - Cancel
+        """
+
+        self.console.print(Panel(menu_text, border_style="cyan", padding=(1, 2)))
+
+        format_choice = Prompt.ask("[bold cyan]Select format (1-3)[/bold cyan]").strip()
+
+        if format_choice.lower() in ['back', 'cancel', 'exit']:
+            return
+
+        format_map = {'1': 'txt', '2': 'md', '3': 'json'}
+        export_format = format_map.get(format_choice)
+
+        if not export_format:
+            self.console.print("[red]Invalid format selection[/red]")
+            return
+
+        # Export only the most recent conversation
+        progress = self.create_progress()
+        task = progress.add_task("[bold cyan]💾 Saving current chat...[/bold cyan]", total=100)
+
+        with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+            for i in range(0, 100, 5):
+                progress.update(task, completed=i)
+                time.sleep(0.02)
+
+            filepath = self.assistant.file_manager.export_conversations_to_file(
+                self.user_id,
+                format=export_format,
+                limit=1  # Only export last conversation
+            )
+
+            progress.update(task, completed=100, description="[bold green]✅ Current chat saved![/bold green]")
+
+        if filepath:
+            file_size = Path(filepath).stat().st_size
+
+            success_text = f"""
+            [bold green]✅ Current chat saved successfully![/bold green]
+
+            📁 File: [bold cyan]{Path(filepath).name}[/bold cyan]
+            📏 Size: [bold]{decimal(file_size)}[/bold]
+            📍 Location: [dim]{filepath}[/dim]
+            """
+
+            self.console.print(Panel(success_text, border_style="green", padding=(1, 2)))
+        else:
+            self.console.print("[red]❌ No conversation to save[/red]")
+
+    def download_selected_chats(self):
+        """Interactively select specific chats to download"""
+
+        # Load conversations
+        progress = self.create_progress()
+        task = progress.add_task("[bold cyan]📋 Loading conversations...[/bold cyan]", total=100)
+
+        with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+            for i in range(0, 100, 10):
+                progress.update(task, completed=i)
+                time.sleep(0.02)
+
+            conversations = self.assistant.file_manager.get_recent_conversations(self.user_id, 50)
+            progress.update(task, completed=100, description="[bold green]✅ Loaded![/bold green]")
+
+        if not conversations:
+            self.console.print("[yellow]No conversations found[/yellow]")
+            return
+
+        # Display conversations for selection
+        convs_table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            box=ROUNDED,
+            title=f"Select Conversations to Download (Total: {len(conversations)})"
+        )
+        convs_table.add_column("#", style="bold magenta", width=4)
+        convs_table.add_column("Date", style="dim", width=16)
+        convs_table.add_column("Your Message", style="cyan", width=40)
+        convs_table.add_column("Quality", style="green", width=8)
+
+        for i, conv in enumerate(conversations, 1):
+            user_msg = conv.user_message[:37] + "..." if len(conv.user_message) > 40 else conv.user_message
+            quality = f"{conv.multi_agent_session.quality_score:.2f}" if conv.multi_agent_session else "N/A"
+
+            convs_table.add_row(
+                str(i),
+                conv.timestamp.strftime("%Y-%m-%d %H:%M"),
+                user_msg,
+                quality
+            )
+
+        self.console.print(Panel(convs_table, border_style="cyan", padding=(1, 1)))
+
+        # Get user selection
+        selection_text = """
+        [bold cyan]Enter your selection:[/bold cyan]
+        • Single: [bold]5[/bold] (conversation #5)
+        • Range: [bold]1-10[/bold] (conversations 1 to 10)
+        • Multiple: [bold]1,5,8[/bold] (conversations 1, 5, and 8)
+        • All: [bold]all[/bold]
+        • Cancel: [bold]back[/bold]
+        """
+        self.console.print(selection_text)
+
+        selection = Prompt.ask("[bold cyan]Your selection[/bold cyan]").strip().lower()
+
+        if selection in ['back', 'cancel', 'exit']:
+            return
+
+        # Parse selection
+        selected_indices = set()
+
+        try:
+            if selection == 'all':
+                selected_indices = set(range(len(conversations)))
+            elif '-' in selection:
+                # Range selection (e.g., "1-10")
+                start, end = map(int, selection.split('-'))
+                selected_indices = set(range(start - 1, min(end, len(conversations))))
+            elif ',' in selection:
+                # Multiple selection (e.g., "1,3,5")
+                selected_indices = {int(x.strip()) - 1 for x in selection.split(',')}
+            else:
+                # Single selection (e.g., "5")
+                selected_indices = {int(selection) - 1}
+
+            # Validate indices
+            selected_indices = {i for i in selected_indices if 0 <= i < len(conversations)}
+
+            if not selected_indices:
+                self.console.print("[red]No valid conversations selected[/red]")
+                return
+
+        except ValueError:
+            self.console.print("[red]Invalid selection format[/red]")
+            return
+
+        # Show selection summary
+        self.console.print(f"\n[bold green]Selected {len(selected_indices)} conversation(s)[/bold green]")
+
+        # Choose format
+        format_choice = Prompt.ask("[bold cyan]Format? (1=txt, 2=md, 3=json)[/bold cyan]").strip()
+        format_map = {'1': 'txt', '2': 'md', '3': 'json'}
+        export_format = format_map.get(format_choice, 'txt')
+
+        # Export selected conversations
+        selected_convs = [conversations[i] for i in sorted(selected_indices)]
+
+        # Temporarily save selected conversations
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"selected_chats_{timestamp}.{export_format}"
+        filepath = self.assistant.file_manager.data_dir / filename
+
+        progress = self.create_progress()
+        task = progress.add_task("[bold cyan]💾 Exporting selected chats...[/bold cyan]", total=100)
+
+        with Live(progress, auto_refresh=True, console=self.console, refresh_per_second=20):
+            for i in range(0, 60, 5):
+                progress.update(task, completed=i)
+                time.sleep(0.02)
+
+            # Format content based on export format
+            if export_format == 'txt':
+                content = self.assistant.file_manager._format_txt_export(selected_convs)
+            elif export_format == 'md':
+                content = self.assistant.file_manager._format_markdown_export(selected_convs)
+            else:
+                content = self.assistant.file_manager._format_json_export(selected_convs)
+
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(content)
+
+            for i in range(60, 100, 5):
+                progress.update(task, completed=i)
+                time.sleep(0.02)
+
+            progress.update(task, completed=100, description="[bold green]✅ Export complete![/bold green]")
+
+        file_size = filepath.stat().st_size
+
+        success_text = f"""
+        [bold green]✅ Selected chats exported successfully![/bold green]
+
+        📊 Exported: [bold]{len(selected_convs)} conversation(s)[/bold]
+        📁 File: [bold cyan]{filename}[/bold cyan]
+        📏 Size: [bold]{decimal(file_size)}[/bold]
+        📍 Location: [dim]{filepath}[/dim]
+        """
+
+        self.console.print(Panel(success_text, border_style="green", padding=(1, 2)))
+
     async def handle_chat_mode(self):
         """Handle chat mode with persistent context and exit option"""
         self.console.print(Panel(
@@ -3613,6 +4022,10 @@ class RichMultiAgentCLI:
 
                 elif command == "tasks":
                     self.display_tasks()
+                    Prompt.ask("[bold]Press Enter to continue...[/bold]")
+
+                elif command == "download":
+                    self.download_chat_menu()
                     Prompt.ask("[bold]Press Enter to continue...[/bold]")
 
                 elif command == "quality":
